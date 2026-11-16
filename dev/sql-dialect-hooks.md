@@ -9,6 +9,12 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 Based on `e2dc8b048b542e7abdc296254aa54e26eb89d76d` (57.0.0-dev).
 This index links the implementation PRs; it does not merge them.
 
+The [binding-policy proposal](sql-binding-policy-proposal.md) reconsiders the
+contracts in #3 and #5–#8 using earlier upstream design discussions. It proposes
+typed policy decisions over engine-owned binding identities, with private scope,
+dependency and evaluation-placement machinery. The branches below implement the
+original prototypes; they do not yet implement that proposal.
+
 | PR                                                | API / fix                                            | Purpose                                                                             | Base |
 | ------------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------- | ---- |
 | [#1](https://github.com/kuza55/datafusion/pull/1) | QUALIFY validation before window rebasing            | Fix the regression introduced by apache/datafusion#21173.                           | main |
@@ -107,7 +113,11 @@ scalar materialization in one query.
 
 - 109 extension execution tests pass.
 - Formatting and all-target/all-feature Clippy pass.
-- Extended workspace tests and the full nonfunctional suite are running.
+- Extended workspace tests pass: 13,461 Rust tests, 8 ignored, and 307 SQL logic files.
+- The full nonfunctional suite, including Rust and HTML documentation, passes.
+
+The first workspace run timed out in an existing cooperative-scheduling test.
+That test passed alone, and the complete rerun with eight Rust test threads passed.
 
 The original three-PR validation record is preserved at
 [the original index revision](https://github.com/kuza55/datafusion/blob/5fbefcd84206851f2d2cb62b247ad562965e3420/dev/sql-dialect-hooks.md).
