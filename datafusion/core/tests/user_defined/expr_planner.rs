@@ -189,3 +189,97 @@ async fn test_deferred_struct_colon_operator() {
         ScalarValue::Int64(Some(1))
     );
 }
+
+#[derive(Debug)]
+struct NumericLiteralPlanner;
+
+impl ExprPlanner for NumericLiteralPlanner {
+    fn plan_numeric_literal(
+        &self,
+        literal: datafusion_expr::planner::RawNumericLiteral,
+    ) -> Result<PlannerResult<datafusion_expr::planner::RawNumericLiteral>> {
+        let value = match literal.value.as_str() {
+            "1.2300" => ScalarValue::Decimal128(
+                Some(if literal.negative { -12300 } else { 12300 }),
+                10,
+                4,
+            ),
+            "1e2" if !literal.negative => ScalarValue::Int32(Some(100)),
+            "7" if literal.long && !literal.negative => ScalarValue::Int32(Some(7)),
+            "1_000" if !literal.negative => ScalarValue::Int32(Some(1000)),
+            "999" => {
+                return datafusion_common::plan_err!("literal rejected by extension");
+            }
+            _ => return Ok(PlannerResult::Original(literal)),
+        };
+        Ok(PlannerResult::Planned(lit(value)))
+    }
+}
+
+#[tokio::test]
+async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
+    use datafusion_expr::planner::RawNumericLiteral;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct Observe(Arc<Mutex<Vec<RawNumericLiteral>>>);
+    impl ExprPlanner for Observe {
+        fn plan_numeric_literal(
+            &self,
+            literal: RawNumericLiteral,
+        ) -> Result<PlannerResult<RawNumericLiteral>> {
+            self.0.lock().unwrap().push(literal.clone());
+            Ok(PlannerResult::Original(literal))
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(vec![]));
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "spark");
+    let mut ctx = SessionContext::new_with_config(config);
+    ctx.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
+    ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
+    let batches = ctx
+        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, 1_000, -9223372036854775808 AS min_int")
+        .await?
+        .collect()
+        .await?;
+    let expected = [
+        ScalarValue::Decimal128(Some(12300), 10, 4),
+        ScalarValue::Decimal128(Some(-12300), 10, 4),
+        ScalarValue::Int32(Some(100)),
+        ScalarValue::Int32(Some(7)),
+        ScalarValue::Int32(Some(1000)),
+        ScalarValue::Int64(Some(i64::MIN)),
+    ];
+    for (column, expected) in batches[0].columns().iter().zip(expected) {
+        assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
+    }
+    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
+        value: "1.2300".into(),
+        negative: true,
+        long: false,
+    }));
+    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
+        value: "7".into(),
+        negative: false,
+        long: true,
+    }));
+    let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
+    assert!(error.contains("literal rejected by extension"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn numeric_literal_fallthrough_preserves_defaults() -> Result<()> {
+    let mut ctx = SessionContext::new();
+    ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
+    let batches = ctx.sql("SELECT 42, -42, 0.5").await?.collect().await?;
+    for (column, expected) in batches[0].columns().iter().zip([
+        ScalarValue::Int64(Some(42)),
+        ScalarValue::Int64(Some(-42)),
+        ScalarValue::Float64(Some(0.5)),
+    ]) {
+        assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
+    }
+    Ok(())
+}
