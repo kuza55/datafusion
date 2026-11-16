@@ -430,15 +430,18 @@ async fn select_input_materialization_execution() -> Result<()> {
         );
         let batches = ctx.sql(&sql).await?.collect().await?;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        insta::assert_snapshot!(batches_to_string(&batches), @r"
-        +---+---+---+---+
-        | a | b | c | i |
-        +---+---+---+---+
-        | 1 | 1 | 2 | 1 |
-        | 2 | 2 | 3 | 2 |
-        | 3 | 3 | 4 | 3 |
-        +---+---+---+---+
-        ");
+        datafusion_common::assert_batches_eq!(
+            [
+                "+---+---+---+---+",
+                "| a | b | c | i |",
+                "+---+---+---+---+",
+                "| 1 | 1 | 2 | 1 |",
+                "| 2 | 2 | 3 | 2 |",
+                "| 3 | 3 | 4 | 3 |",
+                "+---+---+---+---+",
+            ],
+            &batches
+        );
         for sql in [
             "SELECT sum(i) AS a FROM (VALUES (1)) t(i)",
             "SELECT row_number() OVER () AS a FROM (VALUES (1)) t(i)",
