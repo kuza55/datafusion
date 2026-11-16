@@ -269,7 +269,11 @@ pub struct PlannerContext {
     lambda_parameters: HashMap<String, FieldRef>,
     pub(crate) identifier_projection: Arc<[SelectItem]>,
     pub(crate) identifier_clause: IdentifierClause,
-    pub(crate) identifier_expansions: Vec<String>,
+    pub(crate) identifier_expansions: Vec<usize>,
+    pub(crate) identifier_schema: Option<DFSchemaRef>,
+    pub(crate) identifier_input: Option<Arc<LogicalPlan>>,
+    pub(crate) join_bindings:
+        Vec<(DFSchemaRef, Vec<crate::relation::join::JoinColumnBinding>)>,
 }
 
 impl Default for PlannerContext {
@@ -292,6 +296,9 @@ impl PlannerContext {
             identifier_projection: Arc::from([]),
             identifier_clause: IdentifierClause::Other,
             identifier_expansions: vec![],
+            identifier_schema: None,
+            identifier_input: None,
+            join_bindings: vec![],
         }
     }
 

@@ -21,9 +21,7 @@ use datafusion_common::{
     file_options::file_type::FileType, not_impl_err,
 };
 #[cfg(feature = "sql")]
-use sqlparser::ast::{
-    Expr as SQLExpr, Ident, JoinOperator, ObjectName, SelectItem, TableAlias, TableFactor,
-};
+use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor};
 
 /// Provides the `SQL` query planner meta-data about tables and
 /// functions referenced in SQL statements, without a direct dependency on the
@@ -143,18 +141,12 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
-    /// Plan a bare identifier after lambda/variable lookup and before column lookup.
+    /// Select an engine-owned column or alias definition. `None` preserves lookup.
     ///
-    /// Return `None` to preserve normal resolution. Implementations own precedence
-    /// and ambiguity policy; use `schema` and the outer schemas before substituting
-    /// aliases. Qualified identifiers use the existing compound-identifier path.
+    /// The returned ID must belong to this request. Both bare and qualified
+    /// columns are supported; nested field access retains its existing planner.
     #[cfg(feature = "sql")]
-    fn plan_identifier(
-        &self,
-        _identifier: &Ident,
-        _schema: &DFSchema,
-        _context: &mut dyn IdentifierPlannerContext,
-    ) -> Result<Option<Expr>> {
+    fn resolve_column(&self, _request: &ColumnLookup<'_>) -> Result<Option<BindingId>> {
         Ok(None)
     }
 
@@ -340,26 +332,148 @@ pub enum IdentifierClause {
     Other,
 }
 
-/// Query-local context for [`ExprPlanner::plan_identifier`].
-///
-/// This interface exposes binding inputs, not an alias materialization mechanism.
-/// Substituting volatile expressions can change evaluation counts; extensions
-/// must materialize them elsewhere or reject such substitutions.
+/// Opaque identity of an engine-supplied binding, valid only in its request.
 #[cfg(feature = "sql")]
-pub trait IdentifierPlannerContext {
-    /// Projection of the current SELECT, without projections from outer queries.
-    fn projection(&self) -> &[SelectItem];
-    /// Clause in which the identifier occurs.
-    fn clause(&self) -> IdentifierClause;
-    /// Outer query schemas, ordered from outermost to innermost.
-    fn outer_query_schemas(&self) -> &[datafusion_common::DFSchemaRef];
-    /// Normalize an identifier using the current parser options.
-    fn normalize_ident(&self, identifier: Ident) -> String;
-    /// Plan a replacement in the current expression's schema and scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingId(u64);
+
+/// Origin of a candidate SQL binding.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnBindingKind {
+    /// A column in the current input.
+    Input,
+    /// An original qualified key hidden from an unqualified USING wildcard.
+    UsingInput,
+    /// The merged unqualified output of a USING or NATURAL join.
+    Using,
+    /// An explicitly named SELECT expression, before wildcard expansion.
+    SelectAlias { index: usize },
+    /// A correlated column; depth zero is the nearest outer query.
+    Outer { depth: usize },
+}
+
+/// Read-only metadata for a binding the engine can resolve.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnBinding {
+    id: BindingId,
+    column: datafusion_common::Column,
+    kind: ColumnBindingKind,
+}
+
+#[cfg(feature = "sql")]
+impl ColumnBinding {
+    /// Identity to return from a binding hook.
+    pub fn id(&self) -> BindingId {
+        self.id
+    }
+    /// Normalized name and optional relation qualifier.
+    pub fn column(&self) -> &datafusion_common::Column {
+        &self.column
+    }
+    /// Definition origin and position.
+    pub fn kind(&self) -> ColumnBindingKind {
+        self.kind
+    }
+
+    /// Construct engine-owned binding metadata.
     ///
-    /// Re-entering this method for the same identifier in the same SELECT
-    /// produces a cycle error. Subqueries receive independent binding scopes.
-    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr>;
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(column: datafusion_common::Column, kind: ColumnBindingKind) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: BindingId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            column,
+            kind,
+        }
+    }
+}
+
+/// A name lookup with engine-owned candidates. Selecting an alias binds its
+/// definition in its SELECT scope; it does not guarantee single evaluation.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnLookup<'a> {
+    identifiers: &'a [Ident],
+    clause: IdentifierClause,
+    candidates: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> ColumnLookup<'a> {
+    /// Original identifier parts, including quoting and source spans.
+    pub fn identifiers(&self) -> &[Ident] {
+        self.identifiers
+    }
+    /// Clause containing this reference.
+    pub fn clause(&self) -> IdentifierClause {
+        self.clause
+    }
+    /// Matching definitions; the extension chooses precedence and ambiguity policy.
+    pub fn candidates(&self) -> &[ColumnBinding] {
+        self.candidates
+    }
+
+    /// Construct a lookup for SQL planner dispatch.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        identifiers: &'a [Ident],
+        clause: IdentifierClause,
+        candidates: &'a [ColumnBinding],
+    ) -> Self {
+        Self {
+            identifiers,
+            clause,
+            candidates,
+        }
+    }
+}
+
+/// Engine-expanded wildcard columns after built-in modifiers. A hook can select
+/// and reorder these bindings, but cannot supply expressions or change the input.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct WildcardLookup<'a> {
+    qualifier: Option<&'a TableReference>,
+    columns: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> WildcardLookup<'a> {
+    /// Relation selected by `t.*`, or `None` for `*`.
+    pub fn qualifier(&self) -> Option<&TableReference> {
+        self.qualifier
+    }
+    /// Eligible columns in the engine's SQL output order.
+    pub fn columns(&self) -> &[ColumnBinding] {
+        self.columns
+    }
+
+    /// Construct an engine-expanded wildcard request.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        qualifier: Option<&'a TableReference>,
+        columns: &'a [ColumnBinding],
+    ) -> Self {
+        Self { qualifier, columns }
+    }
 }
 
 /// An operator with two arguments to plan
@@ -469,58 +583,19 @@ pub enum RelationPlanning {
     Original(Box<TableFactor>),
 }
 
-/// SQL join inputs, planned once before extension dispatch.
-#[cfg(feature = "sql")]
-#[derive(Debug)]
-pub struct RawSqlJoin {
-    /// Left input, including the output of earlier joins in the FROM item.
-    pub left: LogicalPlan,
-    /// Right input, planned with the normal lateral/correlation context.
-    pub right: LogicalPlan,
-    /// SQL operator and its unresolved constraint.
-    pub operator: JoinOperator,
-}
-
-/// Result of a SQL join planning extension.
-#[cfg(feature = "sql")]
-#[derive(Debug)]
-pub enum JoinPlanning {
-    /// Supply the plan consumed by subsequent joins and SELECT clauses.
-    Planned(Box<LogicalPlan>),
-    /// Continue through registered planners and then built-in join planning.
-    Original(Box<RawSqlJoin>),
-}
-
 /// Customize planning SQL table factors to [`LogicalPlan`]s.
 #[cfg(feature = "sql")]
 /// For more background, please also see the [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
-    /// Plan a join after both inputs, but before binding its SQL constraint.
-    ///
-    /// Extensions can project merged USING keys while retaining qualified source
-    /// fields. The returned schema is visible to later joins and identifier hooks.
-    fn plan_join(
+    /// Select and order engine-expanded wildcard bindings. `None` preserves them.
+    /// Returned IDs must belong to this request and may not repeat.
+    #[cfg(feature = "sql")]
+    fn expand_wildcard(
         &self,
-        join: RawSqlJoin,
-        _context: &mut dyn RelationPlannerContext,
-    ) -> Result<JoinPlanning> {
-        Ok(JoinPlanning::Original(Box::new(join)))
-    }
-
-    /// Expand a SELECT wildcard using the input plan's SQL-visible bindings.
-    ///
-    /// Only `Wildcard` and `QualifiedWildcard` items are passed here. The first
-    /// `Some` result replaces the complete item, including all its modifiers;
-    /// extensions must implement or reject modifiers they accept. `None` retains
-    /// built-in expansion. Returned expressions undergo normal projection checks.
-    fn plan_wildcard(
-        &self,
-        _wildcard: &SelectItem,
-        _input: &LogicalPlan,
-        _context: &mut dyn RelationPlannerContext,
-    ) -> Result<Option<Vec<Expr>>> {
+        _request: &WildcardLookup<'_>,
+    ) -> Result<Option<Vec<BindingId>>> {
         Ok(None)
     }
 
