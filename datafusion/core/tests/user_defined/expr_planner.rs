@@ -255,6 +255,7 @@ async fn identifier_planner_binds_query_local_aliases() -> Result<()> {
     ctx.register_expr_planner(Arc::new(ProjectionAliasPlanner))?;
     for (sql, expected) in [
         ("SELECT 1 AS a, a + 1 AS b, b + 1 AS c", vec![vec![1, 2, 3]]),
+        ("SELECT 1 AS a, [a][1] AS b", vec![vec![1, 1]]),
         (
             "SELECT x + 1 AS a FROM (VALUES (1), (2)) t(x) WHERE a > 2",
             vec![vec![3]],
