@@ -33,6 +33,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         query_plan_context.identifier_clause =
             datafusion_expr::planner::IdentifierClause::Other;
         query_plan_context.identifier_expansions.clear();
+        query_plan_context.materialized_columns.clear();
         let planner_context = &mut query_plan_context;
 
         let Query {

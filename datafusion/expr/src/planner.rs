@@ -491,12 +491,54 @@ pub enum JoinPlanning {
     Original(Box<RawSqlJoin>),
 }
 
+/// Stage at which an extension can add computed columns to a SELECT input.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectInputStage {
+    /// FROM is planned; WHERE has not yet been bound or evaluated.
+    BeforeWhere,
+    /// WHERE is planned; SELECT, grouping and windows have not yet been planned.
+    BeforeProjection,
+}
+
+/// Query-local access to a SELECT input and its computed columns.
+#[cfg(feature = "sql")]
+pub trait SelectInputPlannerContext {
+    /// Current input, including previously materialized columns.
+    fn input(&self) -> &LogicalPlan;
+    /// Plan an SQL expression in the current input schema and query scope.
+    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr>;
+    /// Add one scalar expression as a computed column and return its reference.
+    ///
+    /// Each call creates a distinct slot; reusing the returned column reuses its
+    /// value. Inputs must already be available at this stage. Aggregates, windows,
+    /// and expressions containing subqueries are rejected. Generated columns are
+    /// excluded from subsequent SELECT wildcard expansion.
+    fn materialize(&mut self, expr: Expr) -> Result<datafusion_common::Column>;
+}
+
 /// Customize planning SQL table factors to [`LogicalPlan`]s.
 #[cfg(feature = "sql")]
 /// For more background, please also see the [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Customize SELECT expressions after FROM and again after WHERE planning.
+    ///
+    /// Planners run in registration order and may replace projection expressions.
+    /// Replacing an alias definition with a materialized column lets identifier
+    /// extensions bind later references to that value rather than duplicate it.
+    /// This hook does not run for DataFrame projections.
+    fn plan_select_input(
+        &self,
+        _projection: &mut Vec<SelectItem>,
+        _stage: SelectInputStage,
+        _context: &mut dyn SelectInputPlannerContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Plan a join after both inputs, but before binding its SQL constraint.
     ///
     /// Extensions can project merged USING keys while retaining qualified source
