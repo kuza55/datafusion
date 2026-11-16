@@ -239,7 +239,7 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
     ctx.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
     ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
     let batches = ctx
-        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, 1_000, -9223372036854775808 AS min_int")
+        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, -9223372036854775808 AS min_int")
         .await?
         .collect()
         .await?;
@@ -248,7 +248,6 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
         ScalarValue::Decimal128(Some(-12300), 10, 4),
         ScalarValue::Int32(Some(100)),
         ScalarValue::Int32(Some(7)),
-        ScalarValue::Int32(Some(1000)),
         ScalarValue::Int64(Some(i64::MIN)),
     ];
     for (column, expected) in batches[0].columns().iter().zip(expected) {
@@ -263,6 +262,16 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
         value: "7".into(),
         negative: false,
         long: true,
+    }));
+    let mut postgres = SessionContext::new_with_config(
+        SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres"),
+    );
+    postgres.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
+    postgres.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
+    let batches = postgres.sql("SELECT 1_000").await?.collect().await?;
+    assert_eq!(ScalarValue::try_from_array(batches[0].column(0), 0)?, ScalarValue::Int32(Some(1000)));
+    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
+        value: "1_000".into(), negative: false, long: false,
     }));
     let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
     assert!(error.contains("literal rejected by extension"), "{error}");
