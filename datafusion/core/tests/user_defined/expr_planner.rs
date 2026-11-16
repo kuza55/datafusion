@@ -459,3 +459,126 @@ async fn numeric_literal_fallthrough_preserves_defaults() -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Debug)]
+struct MaterializeFirst(datafusion_expr::planner::SelectInputStage);
+
+impl datafusion_expr::planner::RelationPlanner for MaterializeFirst {
+    fn plan_relation(
+        &self,
+        relation: sqlparser::ast::TableFactor,
+        _context: &mut dyn datafusion_expr::planner::RelationPlannerContext,
+    ) -> Result<datafusion_expr::planner::RelationPlanning> {
+        Ok(datafusion_expr::planner::RelationPlanning::Original(
+            Box::new(relation),
+        ))
+    }
+
+    fn plan_select_input(
+        &self,
+        projection: &mut Vec<sqlparser::ast::SelectItem>,
+        stage: datafusion_expr::planner::SelectInputStage,
+        context: &mut dyn datafusion_expr::planner::SelectInputPlannerContext,
+    ) -> Result<()> {
+        if stage != self.0 {
+            return Ok(());
+        }
+        if let Some(sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) =
+            projection.first_mut()
+        {
+            let planned = context.sql_to_expr(expr.clone())?;
+            let column = context.materialize(planned)?;
+            *expr = sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::with_quote(
+                '"',
+                column.name,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn select_input_materialization_execution() -> Result<()> {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::DataType;
+    use datafusion_expr::planner::SelectInputStage::{BeforeProjection, BeforeWhere};
+    use datafusion_expr::{ColumnarValue, Volatility, create_udf};
+    use std::sync::atomic::AtomicUsize;
+    for stage in [BeforeWhere, BeforeProjection] {
+        let mut ctx = SessionContext::new();
+        ctx.register_expr_planner(Arc::new(ProjectionAliasPlanner))?;
+        ctx.register_relation_planner(Arc::new(MaterializeFirst(stage)))?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let udf_calls = Arc::clone(&calls);
+        ctx.register_udf(create_udf(
+            "tick",
+            vec![DataType::Int64],
+            DataType::Int64,
+            Volatility::Volatile,
+            Arc::new(move |args| {
+                let len = match &args[0] {
+                    ColumnarValue::Array(a) => a.len(),
+                    _ => 1,
+                };
+                let start = udf_calls.fetch_add(len, Ordering::SeqCst);
+                Ok(ColumnarValue::Array(Arc::new(
+                    Int64Array::from_iter_values(
+                        (start..start + len).map(|n| n as i64 + 1),
+                    ),
+                )))
+            }),
+        ));
+        let predicate = if stage == BeforeWhere {
+            "WHERE a > 0"
+        } else {
+            "WHERE i > 0"
+        };
+        let sql = format!(
+            "SELECT tick(i) AS a, a AS b, a + 1 AS c, * FROM (VALUES (1),(2),(3)) t(i) {predicate} ORDER BY i"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(batches[0].num_columns(), 4);
+        for batch in batches {
+            let a = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let b = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let c = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                assert_eq!(a.value(row), b.value(row));
+                assert_eq!(a.value(row) + 1, c.value(row));
+            }
+        }
+        for sql in [
+            "SELECT sum(i) AS a FROM (VALUES (1)) t(i)",
+            "SELECT row_number() OVER () AS a FROM (VALUES (1)) t(i)",
+            "SELECT (SELECT 1) AS a",
+        ] {
+            assert!(ctx.sql(sql).await.is_err(), "{sql}");
+        }
+        let batches = ctx
+            .sql("SELECT 7 AS a, * FROM (SELECT 1 AS __df_materialized_0, 2 AS i) t")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(batches[0].num_columns(), 3);
+        let batches = ctx
+            .sql("SELECT 1 AS a UNION ALL SELECT 2 AS a")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+    Ok(())
+}

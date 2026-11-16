@@ -33,7 +33,9 @@ use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
     normalize_col, normalize_col_with_schemas_and_ambiguity_check, normalize_sorts,
 };
-use datafusion_expr::planner::IdentifierClause;
+use datafusion_expr::planner::{
+    IdentifierClause, SelectInputPlannerContext, SelectInputStage,
+};
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::utils::{
     conjunction, expr_as_column_expr, expr_to_columns, find_aggregate_exprs,
@@ -85,6 +87,66 @@ fn flatten_expr_groups(expr_groups: Vec<Vec<Expr>>) -> Vec<Expr> {
     expr_groups.into_iter().flatten().collect()
 }
 
+struct SelectInputContext<'a, 'b, S: ContextProvider> {
+    planner: &'a SqlToRel<'b, S>,
+    planner_context: &'a mut PlannerContext,
+    input: LogicalPlan,
+    reserved_names: HashSet<String>,
+}
+
+impl<S: ContextProvider> SelectInputPlannerContext for SelectInputContext<'_, '_, S> {
+    fn input(&self) -> &LogicalPlan {
+        &self.input
+    }
+
+    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr> {
+        self.planner
+            .sql_to_expr(expr, self.input.schema(), self.planner_context)
+    }
+
+    fn materialize(&mut self, expr: Expr) -> Result<Column> {
+        expr.apply(|expr| {
+            if matches!(expr, Expr::AggregateFunction(_) | Expr::WindowFunction(_)
+                | Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)
+                | Expr::OuterReferenceColumn(_, _) | Expr::Unnest(_)) {
+                return plan_err!("SELECT input materialization requires a scalar expression over the current input");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let mut index = self.planner_context.materialized_columns.len();
+        let name = loop {
+            let name = format!("__df_materialized_{index}");
+            if !self
+                .input
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == &name)
+                && !self.reserved_names.contains(&name)
+            {
+                break name;
+            }
+            index += 1;
+        };
+        let column = Column::from_name(name);
+        let mut expressions: Vec<_> = self
+            .input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+        expressions.push(expr.alias(&column.name));
+        self.input = LogicalPlanBuilder::from(self.input.clone())
+            .project(expressions)?
+            .build()?;
+        self.planner_context
+            .materialized_columns
+            .push(column.clone());
+        Ok(column)
+    }
+}
+
 impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Generate a logic plan from an SQL select
     pub(super) fn select_to_plan(
@@ -102,11 +164,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             IdentifierClause::From,
         );
         let expansions = std::mem::take(&mut planner_context.identifier_expansions);
+        let materialized = std::mem::take(&mut planner_context.materialized_columns);
         let result = self.select_to_plan_inner(select, query_order_by, planner_context);
+        planner_context.materialized_columns = materialized;
         planner_context.identifier_projection = projection;
         planner_context.identifier_clause = clause;
         planner_context.identifier_expansions = expansions;
         result
+    }
+
+    fn plan_select_input_extensions(
+        &self,
+        input: LogicalPlan,
+        select: &mut Select,
+        stage: SelectInputStage,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        if self.context_provider.get_relation_planners().is_empty() {
+            return Ok(input);
+        }
+        let reserved_names = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => {
+                    Some(self.ident_normalizer.normalize(alias.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut context = SelectInputContext {
+            planner: self,
+            planner_context,
+            input,
+            reserved_names,
+        };
+        for planner in self.context_provider.get_relation_planners() {
+            planner.plan_select_input(&mut select.projection, stage, &mut context)?;
+            context.planner_context.identifier_projection =
+                select.projection.clone().into();
+        }
+        Ok(context.input)
     }
 
     fn select_to_plan_inner(
@@ -135,12 +233,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let set_expr_left_schema = planner_context.set_set_expr_left_schema(None);
 
         // Process `from` clause
-        let plan = self.plan_from_tables(select.from, planner_context)?;
+        let plan =
+            self.plan_from_tables(std::mem::take(&mut select.from), planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
 
+        let plan = self.plan_select_input_extensions(
+            plan,
+            &mut select,
+            SelectInputStage::BeforeWhere,
+            planner_context,
+        )?;
         planner_context.identifier_clause = IdentifierClause::Where;
         // Process `where` clause
-        let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
+        let base_plan =
+            self.plan_selection(select.selection.take(), plan, planner_context)?;
+        let base_plan = self.plan_select_input_extensions(
+            base_plan,
+            &mut select,
+            SelectInputStage::BeforeProjection,
+            planner_context,
+        )?;
 
         // Handle named windows before processing the projection expression
         check_conflicting_windows(&select.named_window)?;
@@ -1142,7 +1254,35 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let previous_clause = planner_context.identifier_clause;
         for (index, expr) in projection.into_iter().enumerate() {
             planner_context.identifier_clause = IdentifierClause::Select { index };
+            if matches!(
+                &expr,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            ) {
+                match self.plan_extension_wildcard(&expr, plan, planner_context) {
+                    Ok(Some(exprs)) => {
+                        prepared_select_exprs
+                            .extend(exprs.into_iter().filter(|expr| !matches!(expr, Expr::Column(c) if planner_context.materialized_columns.contains(c))).map(SelectExpr::Expression));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        error_builder.add_error(err);
+                        continue;
+                    }
+                }
+            }
             match self.sql_select_to_rex(expr, plan, empty_from, planner_context) {
+                Ok(
+                    expr
+                    @ (SelectExpr::Wildcard(_) | SelectExpr::QualifiedWildcard(_, _)),
+                ) if !planner_context.materialized_columns.is_empty() => {
+                    let expanded = LogicalPlanBuilder::from(plan.clone())
+                        .project([expr])?
+                        .build()?;
+                    prepared_select_exprs.extend(expanded.expressions().into_iter()
+                        .filter(|expr| !matches!(expr, Expr::Column(c) if planner_context.materialized_columns.contains(c)))
+                        .map(SelectExpr::Expression));
+                }
                 Ok(expr) => prepared_select_exprs.push(expr),
                 Err(err) => error_builder.add_error(err),
             }

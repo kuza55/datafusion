@@ -727,3 +727,441 @@ mod tests {
         ");
     }
 }
+
+#[derive(Debug)]
+struct MergedJoinPlanner;
+
+impl MergedJoinPlanner {
+    fn key(schema: &datafusion_common::DFSchema) -> Result<Expr> {
+        if schema.has_column_with_qualified_name(&"__merged".into(), "k") {
+            Ok(col("__merged.k"))
+        } else {
+            let (qualifier, field) = schema.qualified_field_with_unqualified_name("k")?;
+            Ok(Expr::Column(Column::new(qualifier.cloned(), field.name())))
+        }
+    }
+}
+
+impl RelationPlanner for MergedJoinPlanner {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn plan_join(
+        &self,
+        join: datafusion_expr::planner::RawSqlJoin,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<datafusion_expr::planner::JoinPlanning> {
+        use datafusion_expr::planner::JoinPlanning;
+        use datafusion_sql::sqlparser::ast::{JoinConstraint, JoinOperator};
+        let join_type = match &join.operator {
+            JoinOperator::FullOuter(JoinConstraint::Using(keys))
+                if keys.len() == 1 && keys[0].to_string() == "k" =>
+            {
+                JoinType::Full
+            }
+            JoinOperator::FullOuter(JoinConstraint::Natural) => JoinType::Full,
+            _ => return Ok(JoinPlanning::Original(Box::new(join))),
+        };
+        let left_key = Self::key(join.left.schema())?;
+        let right_key = Self::key(join.right.schema())?;
+        let merged = coalesce(vec![left_key.clone(), right_key.clone()])
+            .alias_qualified(Some("__merged"), "k");
+        let input = LogicalPlanBuilder::from(join.left)
+            .join_on(join.right, join_type, [left_key.eq(right_key)])?
+            .build()?;
+        let mut fields = vec![merged];
+        fields.extend(
+            input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|c| {
+                    c.relation
+                        .as_ref()
+                        .is_none_or(|r| r.to_string() != "__merged")
+                })
+                .map(Expr::Column),
+        );
+        let plan = LogicalPlanBuilder::from(input).project(fields)?.build()?;
+        Ok(JoinPlanning::Planned(Box::new(plan)))
+    }
+
+    fn plan_wildcard(
+        &self,
+        wildcard: &sqlparser::ast::SelectItem,
+        input: &datafusion_expr::LogicalPlan,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        use datafusion_sql::sqlparser::ast::SelectItem;
+        if !input
+            .schema()
+            .has_column_with_qualified_name(&"__merged".into(), "k")
+        {
+            return Ok(None);
+        }
+        let SelectItem::Wildcard(options) = wildcard else {
+            return Ok(None);
+        };
+        if options.opt_exclude.is_some()
+            || options.opt_except.is_some()
+            || options.opt_replace.is_some()
+            || options.opt_rename.is_some()
+            || options.opt_ilike.is_some()
+            || options.opt_alias.is_some()
+        {
+            return datafusion_common::plan_err!(
+                "Example merged-key planner requires a plain wildcard"
+            );
+        }
+        let mut fields = vec![col("__merged.k").alias("k")];
+        fields.extend(
+            input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|c| c.name != "k")
+                .map(Expr::Column),
+        );
+        Ok(Some(fields))
+    }
+}
+
+impl datafusion_expr::planner::ExprPlanner for MergedJoinPlanner {
+    fn plan_identifier(
+        &self,
+        identifier: &sqlparser::ast::Ident,
+        schema: &datafusion_common::DFSchema,
+        context: &mut dyn datafusion_expr::planner::IdentifierPlannerContext,
+    ) -> Result<Option<Expr>> {
+        if context.normalize_ident(identifier.clone()) == "k"
+            && schema.has_column_with_qualified_name(&"__merged".into(), "k")
+        {
+            Ok(Some(col("__merged.k")))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn join_wildcard_policy_execution() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    let mut ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+    ctx.register_relation_planner(Arc::new(MergedJoinPlanner))?;
+    ctx.register_expr_planner(Arc::new(MergedJoinPlanner))?;
+    let from = "FROM (VALUES (1, 10), (2, 20)) a(k, av) FULL JOIN (VALUES (2, 200), (3, 300)) b(k, bv) USING (k)";
+    let sql = format!("SELECT * {from} ORDER BY k");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----+-----+
+    | k | av | bv  |
+    +---+----+-----+
+    | 1 | 10 |     |
+    | 2 | 20 | 200 |
+    | 3 |    | 300 |
+    +---+----+-----+
+    ");
+    let sql = format!("SELECT k, a.k AS left_key, b.k AS right_key {from} WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----------+-----------+
+    | k | left_key | right_key |
+    +---+----------+-----------+
+    | 3 |          | 3         |
+    +---+----------+-----------+
+    ");
+    let sql = format!(
+        "SELECT * {from} FULL JOIN (VALUES (3, 3000), (4, 4000)) c(k, cv) USING (k) WHERE k >= 3 ORDER BY k"
+    );
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----+-----+------+
+    | k | av | bv  | cv   |
+    +---+----+-----+------+
+    | 3 |    | 300 | 3000 |
+    | 4 |    |     | 4000 |
+    +---+----+-----+------+
+    ");
+    let sql = format!("SELECT a.* {from} WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(batches[0].num_columns(), 2);
+    assert_eq!(batches[0].column(0).null_count(), 1);
+    let sql = format!("SELECT * FROM (SELECT * {from}) derived WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    let sql =
+        "SELECT * FROM (VALUES (1)) a(k) NATURAL FULL JOIN (VALUES (2)) b(k) ORDER BY k";
+    let batches = ctx.sql(sql).await?.collect().await?;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    assert!(
+        ctx.sql(&format!("SELECT * EXCLUDE (av) {from}"))
+            .await
+            .is_err()
+    );
+    // No hook accepts this ON join or its wildcard, so the default path is retained.
+    let batches = ctx
+        .sql("SELECT a.* FROM (VALUES (1)) a(k) JOIN (VALUES (1)) b(k) ON a.k = b.k")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batches[0].num_rows(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_and_materialization_hooks_execute_together() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    use datafusion_expr::planner::{SelectInputPlannerContext, SelectInputStage};
+    use sqlparser::ast::{Expr as SqlExpr, Ident, SelectItem};
+    #[derive(Debug)]
+    struct MaterializeKey;
+    impl RelationPlanner for MaterializeKey {
+        fn plan_relation(
+            &self,
+            relation: TableFactor,
+            _context: &mut dyn RelationPlannerContext,
+        ) -> Result<RelationPlanning> {
+            Ok(RelationPlanning::Original(Box::new(relation)))
+        }
+        fn plan_select_input(
+            &self,
+            projection: &mut Vec<SelectItem>,
+            stage: SelectInputStage,
+            context: &mut dyn SelectInputPlannerContext,
+        ) -> Result<()> {
+            if stage == SelectInputStage::BeforeProjection
+                && let Some(SelectItem::ExprWithAlias { expr, alias }) =
+                    projection.first_mut()
+                && alias.value == "selected_key"
+            {
+                let planned = context.sql_to_expr(expr.clone())?;
+                let column = context.materialize(planned)?;
+                *expr = SqlExpr::Identifier(Ident::with_quote('"', column.name));
+            }
+            Ok(())
+        }
+    }
+    let mut ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(MergedJoinPlanner))?;
+    ctx.register_relation_planner(Arc::new(MaterializeKey))?;
+    ctx.register_expr_planner(Arc::new(MergedJoinPlanner))?;
+    let sql = "SELECT k AS selected_key, * FROM (VALUES (2, 20)) a(k, av) FULL JOIN (VALUES (3, 30)) b(k, bv) USING (k) ORDER BY k";
+    let batches = ctx.sql(sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +--------------+---+----+----+
+    | selected_key | k | av | bv |
+    +--------------+---+----+----+
+    | 2            | 2 | 20 |    |
+    | 3            | 3 |    | 30 |
+    +--------------+---+----+----+
+    ");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PrefixColumnAliases;
+
+impl RelationPlanner for PrefixColumnAliases {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn plan_column_aliases(
+        &self,
+        aliases: &[String],
+        schema: &datafusion_common::DFSchema,
+    ) -> Result<Option<Vec<String>>> {
+        if aliases.len() > schema.fields().len() {
+            return datafusion_common::plan_err!("Too many column aliases");
+        }
+        Ok(Some(
+            aliases
+                .iter()
+                .cloned()
+                .chain(
+                    schema.fields()[aliases.len()..]
+                        .iter()
+                        .map(|f| f.name().clone()),
+                )
+                .collect(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn column_alias_policy_execution() -> Result<()> {
+    let ctx = SessionContext::new();
+    let partial = "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(x)";
+    assert!(ctx.sql(partial).await.is_err());
+    ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+    ctx.register_relation_planner(Arc::new(PrefixColumnAliases))?;
+    for sql in [
+        partial,
+        "WITH RECURSIVE t(x) AS (SELECT 1 AS a, 2 AS b UNION ALL SELECT x + 1, b FROM t WHERE x < 2) SELECT x, b FROM t WHERE x = 1",
+        "WITH t(x) AS (SELECT 1 AS a, 2 AS b) SELECT x, b FROM t",
+        "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(x, b)",
+        "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(X)",
+        "SELECT \"X\", b FROM (SELECT 1 AS a, 2 AS b) t(\"X\")",
+    ] {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        assert_eq!(batches[0].num_columns(), 2, "{sql}");
+        for (i, expected) in [1, 2].into_iter().enumerate() {
+            assert_eq!(
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+    for sql in [
+        "SELECT a FROM (SELECT 1 AS a, 2 AS b) t(x)",
+        "SELECT * FROM (SELECT 1 AS a, 2 AS b) t(x, y, z)",
+        "SELECT * FROM (SELECT 1 AS a, 2 AS b) t(b)",
+    ] {
+        assert!(ctx.sql(sql).await.is_err(), "{sql}");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CtePrecedence(datafusion_expr::planner::CteConflictResolution);
+
+impl RelationPlanner for CtePrecedence {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn resolve_cte_conflict(
+        &self,
+        _name: &str,
+    ) -> Result<Option<datafusion_expr::planner::CteConflictResolution>> {
+        Ok(Some(self.0))
+    }
+}
+
+#[tokio::test]
+async fn cte_conflict_policy_execution() -> Result<()> {
+    use datafusion_expr::planner::CteConflictResolution::{KeepOuter, UseInner};
+    let sql = "WITH t AS (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) SELECT x FROM t) AS nested, x AS outer_value FROM t";
+    assert!(SessionContext::new().sql(sql).await.is_err());
+    for (policy, expected) in [(KeepOuter, 1), (UseInner, 2)] {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres"),
+        );
+        ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+        ctx.register_relation_planner(Arc::new(CtePrecedence(policy)))?;
+        for sql in [
+            sql.to_owned(),
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH RECURSIVE t(x) AS (SELECT 2 UNION ALL SELECT x+1 FROM t WHERE x<2) SELECT x AS nested FROM t) u CROSS JOIN t".to_owned(),
+            sql.replace("t AS (SELECT 2", "t AS MATERIALIZED (SELECT 2"),
+            "WITH t AS (SELECT 1 AS x), u AS (WITH t AS (SELECT 2 AS x) SELECT x FROM t) SELECT u.x AS nested, t.x AS outer_value FROM u CROSS JOIN t".to_owned(),
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH T AS (SELECT 2 AS x) SELECT x AS nested FROM t) u CROSS JOIN t".to_owned(),
+        ] {
+            let batches = ctx.sql(&sql).await?.collect().await?;
+            for (i, value) in [expected, 1].into_iter().enumerate() {
+                assert_eq!(batches[0].column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0), value, "{sql}");
+            }
+        }
+        for sql in [
+            "WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t",
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT 2), t AS (SELECT 3) SELECT * FROM t) u",
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT missing_column) SELECT * FROM t) u",
+        ] {
+            assert!(ctx.sql(sql).await.is_err(), "{sql}");
+        }
+        let batches = ctx.sql("WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH \"T\" AS (SELECT 2 AS x) SELECT x AS nested FROM \"T\") u CROSS JOIN t").await?.collect().await?;
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn combined_binding_hooks_execute_together() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    use datafusion_expr::planner::{
+        CteConflictResolution, SelectInputPlannerContext, SelectInputStage,
+    };
+    use sqlparser::ast::{Expr as SqlExpr, Ident, SelectItem};
+    #[derive(Debug)]
+    struct MaterializeKey;
+    impl RelationPlanner for MaterializeKey {
+        fn plan_relation(
+            &self,
+            relation: TableFactor,
+            _context: &mut dyn RelationPlannerContext,
+        ) -> Result<RelationPlanning> {
+            Ok(RelationPlanning::Original(Box::new(relation)))
+        }
+        fn plan_select_input(
+            &self,
+            projection: &mut Vec<SelectItem>,
+            stage: SelectInputStage,
+            context: &mut dyn SelectInputPlannerContext,
+        ) -> Result<()> {
+            if stage == SelectInputStage::BeforeProjection
+                && let Some(SelectItem::ExprWithAlias { expr, alias }) =
+                    projection.first_mut()
+                && alias.value == "selected_key"
+            {
+                let planned = context.sql_to_expr(expr.clone())?;
+                let column = context.materialize(planned)?;
+                *expr = SqlExpr::Identifier(Ident::with_quote('"', column.name));
+            }
+            Ok(())
+        }
+    }
+    let mut ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(PrefixColumnAliases))?;
+    ctx.register_relation_planner(Arc::new(CtePrecedence(
+        CteConflictResolution::UseInner,
+    )))?;
+    ctx.register_relation_planner(Arc::new(MergedJoinPlanner))?;
+    ctx.register_relation_planner(Arc::new(MaterializeKey))?;
+    ctx.register_expr_planner(Arc::new(MergedJoinPlanner))?;
+    let sql = "WITH a AS (SELECT 1 AS k, 10 AS av) SELECT k AS selected_key, * FROM (WITH a(key) AS (SELECT 2 AS k, 20 AS av) SELECT key AS k, av FROM a) a FULL JOIN (VALUES (3, 30)) b(k, bv) USING (k) ORDER BY k";
+    let batches = ctx.sql(sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +--------------+---+----+----+
+    | selected_key | k | av | bv |
+    +--------------+---+----+----+
+    | 2            | 2 | 20 |    |
+    | 3            | 3 |    | 30 |
+    +--------------+---+----+----+
+    ");
+    Ok(())
+}

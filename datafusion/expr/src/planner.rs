@@ -22,7 +22,7 @@ use datafusion_common::{
 };
 #[cfg(feature = "sql")]
 use sqlparser::ast::{
-    Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor,
+    Expr as SQLExpr, Ident, JoinOperator, ObjectName, SelectItem, TableAlias, TableFactor,
 };
 
 /// Provides the `SQL` query planner meta-data about tables and
@@ -494,12 +494,139 @@ pub enum RelationPlanning {
     Original(Box<TableFactor>),
 }
 
+/// Resolution of a CTE name already bound by an enclosing query.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CteConflictResolution {
+    /// Validate the inner definition but keep references bound to the outer CTE.
+    KeepOuter,
+    /// Bind subsequent references in the inner query to its new definition.
+    UseInner,
+}
+
+/// SQL join inputs, planned once before extension dispatch.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct RawSqlJoin {
+    /// Left input, including the output of earlier joins in the FROM item.
+    pub left: LogicalPlan,
+    /// Right input, planned with the normal lateral/correlation context.
+    pub right: LogicalPlan,
+    /// SQL operator and its unresolved constraint.
+    pub operator: JoinOperator,
+}
+
+/// Result of a SQL join planning extension.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub enum JoinPlanning {
+    /// Supply the plan consumed by subsequent joins and SELECT clauses.
+    Planned(Box<LogicalPlan>),
+    /// Continue through registered planners and then built-in join planning.
+    Original(Box<RawSqlJoin>),
+}
+
+/// Stage at which an extension can add computed columns to a SELECT input.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectInputStage {
+    /// FROM is planned; WHERE has not yet been bound or evaluated.
+    BeforeWhere,
+    /// WHERE is planned; SELECT, grouping and windows have not yet been planned.
+    BeforeProjection,
+}
+
+/// Query-local access to a SELECT input and its computed columns.
+#[cfg(feature = "sql")]
+pub trait SelectInputPlannerContext {
+    /// Current input, including previously materialized columns.
+    fn input(&self) -> &LogicalPlan;
+    /// Plan an SQL expression in the current input schema and query scope.
+    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr>;
+    /// Add one scalar expression as a computed column and return its reference.
+    ///
+    /// Each call creates a distinct slot; reusing the returned column reuses its
+    /// value. Inputs must already be available at this stage. Aggregates, windows,
+    /// and expressions containing subqueries are rejected. Generated columns are
+    /// excluded from subsequent SELECT wildcard expansion.
+    fn materialize(&mut self, expr: Expr) -> Result<datafusion_common::Column>;
+}
+
 /// Customize planning SQL table factors to [`LogicalPlan`]s.
 #[cfg(feature = "sql")]
 /// For more background, please also see the [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Customize SELECT expressions after FROM and again after WHERE planning.
+    ///
+    /// Planners run in registration order and may replace projection expressions.
+    /// Replacing an alias definition with a materialized column lets identifier
+    /// extensions bind later references to that value rather than duplicate it.
+    /// This hook does not run for DataFrame projections.
+    fn plan_select_input(
+        &self,
+        _projection: &mut Vec<SelectItem>,
+        _stage: SelectInputStage,
+        _context: &mut dyn SelectInputPlannerContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Plan a join after both inputs, but before binding its SQL constraint.
+    ///
+    /// Extensions can project merged USING keys while retaining qualified source
+    /// fields. The returned schema is visible to later joins and identifier hooks.
+    fn plan_join(
+        &self,
+        join: RawSqlJoin,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<JoinPlanning> {
+        Ok(JoinPlanning::Original(Box::new(join)))
+    }
+
+    /// Expand a SELECT wildcard using the input plan's SQL-visible bindings.
+    ///
+    /// Only `Wildcard` and `QualifiedWildcard` items are passed here. The first
+    /// `Some` result replaces the complete item, including all its modifiers;
+    /// extensions must implement or reject modifiers they accept. `None` retains
+    /// built-in expansion. Returned expressions undergo normal projection checks.
+    fn plan_wildcard(
+        &self,
+        _wildcard: &SelectItem,
+        _input: &LogicalPlan,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        Ok(None)
+    }
+
+    /// Choose precedence when a nested query reuses an enclosing CTE's name.
+    ///
+    /// `name` is normalized according to the SQL planner's identifier options.
+    /// `None` defers to the next planner; if all defer, the existing duplicate-name
+    /// error is retained. Duplicates within a single WITH block always fail.
+    /// Both choices validate the inner definition. Query-local bindings never
+    /// change the enclosing query's CTE map.
+    fn resolve_cte_conflict(&self, _name: &str) -> Result<Option<CteConflictResolution>> {
+        Ok(None)
+    }
+
+    /// Customize normalized column aliases before they are applied to a relation.
+    ///
+    /// The first `Some` result supplies one name per input field; cardinality and
+    /// schema uniqueness are still validated by DataFusion. `None` preserves the
+    /// default exact-length requirement. Empty alias lists do not invoke this hook.
+    /// This also applies to CTE column lists and recursive CTE seed columns.
+    fn plan_column_aliases(
+        &self,
+        _aliases: &[String],
+        _schema: &DFSchema,
+    ) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Plan a table factor into a [`LogicalPlan`].
     ///
     /// Returning [`RelationPlanning::Planned`] short-circuits further planning and uses the
