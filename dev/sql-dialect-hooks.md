@@ -9,6 +9,8 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 Based on `e2dc8b048b542e7abdc296254aa54e26eb89d76d` (57.0.0-dev).
 All implementation PRs independently target `kuza55/datafusion:main`.
 This index does not merge the implementations.
+The [validation commit](https://github.com/kuza55/datafusion/commit/15f1412062daf0513468f52e7f1cda09c9df755c)
+combines #1–#3 and resolves their additive planner/test-file conflicts.
 
 | PR                                                | Extension or fix                                                           | Dependency |
 | ------------------------------------------------- | -------------------------------------------------------------------------- | ---------- |
@@ -25,13 +27,15 @@ can return an expression or defer to the existing parser.
 The identifier hook exposes the current SELECT projection, clause, input schema
 and outer schemas. Extensions choose precedence and alias visibility. Recursive
 replacement planning stays in DataFusion, with scope isolation and cycle checks.
-The execution tests demonstrate immutable aliases in SELECT, WHERE, JOIN ON and
-window arguments. Volatile alias materialization remains the caller's responsibility;
+The execution tests demonstrate non-volatile aliases in SELECT, WHERE, JOIN ON and
+window arguments and array elements. Volatile alias materialization remains the caller's responsibility;
 the example planner rejects it. This is an extension point, not full Snowflake binding.
 
 Existing UDF, type, scalar-function, operator and relation hooks remain useful.
 Merged join keys, wildcard ordering, partial column aliases, duplicate output
-labels and nested CTE policy are separate residual compatibility work.
+labels and nested CTE policy are separate residual compatibility work. These SQL
+hooks do not add physical scalar variants; custom types still need supported
+Arrow storage, metadata and execution functions.
 
 ## QUALIFY regression evidence
 
@@ -63,9 +67,59 @@ fn qualify_projection_regression_21173() {
 
 Run `cargo test --profile ci -p datafusion-sql --test sql_integration qualify_projection_regression_21173 -- --nocapture`.
 The comparison used Rust 1.99.1; no historical implementation changes were made.
+Current `main` with only the new SLT cases also fails six checks; #1 passes them.
 #21173 moved the eligibility scan after window calls in SELECT became column
 references. #1 validates earlier and also excludes windows appearing only in
 ORDER BY from the deferred-volatile path.
+
+## Validation
+
+Rust 1.99.1, on the combined validation commit linked above:
+
+| Check | Result |
+| --- | --- |
+| Focused expression-planner execution tests | 10 passed |
+| Extended workspace suite | 13,455 Rust tests passed, 8 ignored; all 307 SQL logic files passed |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed |
+| Nonfunctional suite | All steps passed; the final HTML-docs step was rerun after installing Graphviz and cargo-depgraph |
+
+The extended suite used:
+
+```sh
+RUST_BACKTRACE=1 cargo test --profile ci \
+  --exclude datafusion-examples --exclude datafusion-benchmarks --exclude datafusion-cli \
+  --workspace --lib --tests --bins \
+  --features avro,json,backtrace,extended_tests,recursive_protection,parquet_encryption
+```
+
+The existing `sql_planner` benchmarks were compared with `main` using the
+unoptimized `ci` profile, 30 samples, a 2-second warmup and 5-second measurement.
+The table shows Criterion's point estimates from the repeat after the test suite
+finished; the first run overlapped fuzz tests and was discarded as noisy.
+
+| Benchmark | Main | Combined hooks |
+| --- | --- | --- |
+| `logical_select_one_from_700` | 1.841 ms | 1.718 ms |
+| `logical_select_all_from_1000` | 23.721 ms | 16.397 ms |
+| `logical_wide_case_50_exprs` | 10.326 ms | 8.103 ms |
+| `optimizer_select_one_from_700` (unchanged control) | 1.673 ms | 1.584 ms |
+
+The unchanged optimizer control also shifted. These are shared-runner smoke
+measurements; release-build overhead remains unmeasured.
+
+To repeat, share `CARGO_TARGET_DIR` between the main and validation worktrees,
+set `CLICKBENCH_DATA_PATH` to `datafusion/core/tests/data/clickbench_hits_10.parquet`
+using an absolute path, and run:
+
+```sh
+cargo bench --profile ci -p datafusion --bench sql_planner -- \
+  'logical_select_one_from_700|logical_select_all_from_1000|logical_wide_case_50_exprs|optimizer_select_one_from_700' \
+  --warm-up-time 2 --measurement-time 5 --sample-size 30 --save-baseline quiet-main
+```
+
+On the validation branch, replace `--save-baseline quiet-main` with
+`--baseline quiet-main`.
 
 ## Upstream precedents
 
