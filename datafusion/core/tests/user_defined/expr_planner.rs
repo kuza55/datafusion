@@ -267,6 +267,7 @@ async fn identifier_planner_binds_query_local_aliases() -> Result<()> {
             "SELECT x + 1 AS a, SUM(a) OVER () AS s FROM (VALUES (1), (2)) t(x) ORDER BY a",
             vec![vec![2, 5], vec![3, 5]],
         ),
+        ("SELECT SUM(x) OVER w AS a, a + 1 AS b FROM (VALUES (1), (2)) t(x) WINDOW w AS ()", vec![vec![3, 4], vec![3, 4]]),
         (
             "SELECT x + 1 AS x, x AS y FROM (VALUES (4)) t(x)",
             vec![vec![5, 4]],
