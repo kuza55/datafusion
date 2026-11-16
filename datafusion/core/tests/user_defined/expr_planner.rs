@@ -269,9 +269,14 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
     postgres.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
     postgres.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
     let batches = postgres.sql("SELECT 1_000").await?.collect().await?;
-    assert_eq!(ScalarValue::try_from_array(batches[0].column(0), 0)?, ScalarValue::Int32(Some(1000)));
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)?,
+        ScalarValue::Int32(Some(1000))
+    );
     assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "1_000".into(), negative: false, long: false,
+        value: "1_000".into(),
+        negative: false,
+        long: false,
     }));
     let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
     assert!(error.contains("literal rejected by extension"), "{error}");
