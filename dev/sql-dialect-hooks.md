@@ -10,11 +10,11 @@ Based on `e2dc8b048b542e7abdc296254aa54e26eb89d76d` (57.0.0-dev).
 All implementation PRs independently target `kuza55/datafusion:main`.
 This index does not merge the implementations.
 
-| PR | Extension or fix | Dependency |
-| --- | --- | --- |
-| [#1](https://github.com/kuza55/datafusion/pull/1) | Validate QUALIFY before rebasing SELECT windows | None |
-| [#2](https://github.com/kuza55/datafusion/pull/2) | `ExprPlanner::plan_numeric_literal(RawNumericLiteral)` | None |
-| [#3](https://github.com/kuza55/datafusion/pull/3) | `ExprPlanner::plan_identifier` with query-local `IdentifierPlannerContext` | None |
+| PR                                                | Extension or fix                                                           | Dependency |
+| ------------------------------------------------- | -------------------------------------------------------------------------- | ---------- |
+| [#1](https://github.com/kuza55/datafusion/pull/1) | Validate QUALIFY before rebasing SELECT windows                            | None       |
+| [#2](https://github.com/kuza55/datafusion/pull/2) | `ExprPlanner::plan_numeric_literal(RawNumericLiteral)`                     | None       |
+| [#3](https://github.com/kuza55/datafusion/pull/3) | `ExprPlanner::plan_identifier` with query-local `IdentifierPlannerContext` | None       |
 
 ## Scope
 
@@ -37,11 +37,11 @@ labels and nested CTE policy are separate residual compatibility work.
 
 The same planner test was executed on the adjacent commits below:
 
-| Revision | Result |
-| --- | --- |
-| [`20434b0`](https://github.com/apache/datafusion/commit/20434b01721905769c9a8f85e8b497a245ccf07c), parent | PASS: Projection → Filter → WindowAggr → Values |
-| [`1e3b956`](https://github.com/apache/datafusion/commit/1e3b956fa79b279bdf02197eb5b35c99a21eb6b4), [#21173](https://github.com/apache/datafusion/pull/21173) | FAIL: `QUALIFY clause requires window functions in the SELECT list or QUALIFY clause` |
-| Current main + #1 | PASS: `qualify.slt`, including source-column, constant, collision and aggregate predicates |
+| Revision                                                                                                                                                     | Result                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| [`20434b0`](https://github.com/apache/datafusion/commit/20434b01721905769c9a8f85e8b497a245ccf07c), parent                                                    | PASS: Projection → Filter → WindowAggr → Values                                            |
+| [`1e3b956`](https://github.com/apache/datafusion/commit/1e3b956fa79b279bdf02197eb5b35c99a21eb6b4), [#21173](https://github.com/apache/datafusion/pull/21173) | FAIL: `QUALIFY clause requires window functions in the SELECT list or QUALIFY clause`      |
+| Current main + #1                                                                                                                                            | PASS: `qualify.slt`, including source-column, constant, collision and aggregate predicates |
 
 ```sql
 SELECT ROW_NUMBER() OVER (ORDER BY x) AS rn
