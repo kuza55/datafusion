@@ -212,7 +212,7 @@ impl ExprPlanner for NumericLiteralPlanner {
             }
             _ => return Ok(PlannerResult::Original(literal)),
         };
-        Ok(PlannerResult::Planned(datafusion_expr::lit(value)))
+        Ok(PlannerResult::Planned(lit(value)))
     }
 }
 
