@@ -78,6 +78,24 @@ impl<S: ContextProvider> RelationPlannerContext for SqlToRelRelationContext<'_, 
 }
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    pub(crate) fn plan_extension_wildcard(
+        &self,
+        wildcard: &sqlparser::ast::SelectItem,
+        input: &LogicalPlan,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        for planner in self.context_provider.get_relation_planners() {
+            let mut context = SqlToRelRelationContext {
+                planner: self,
+                planner_context,
+            };
+            if let Some(exprs) = planner.plan_wildcard(wildcard, input, &mut context)? {
+                return Ok(Some(exprs));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a `LogicalPlan` that scans the named relation.
     ///
     /// First tries any registered extension planners. If no extension handles

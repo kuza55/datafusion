@@ -727,3 +727,197 @@ mod tests {
         ");
     }
 }
+
+#[derive(Debug)]
+struct MergedJoinPlanner;
+
+impl MergedJoinPlanner {
+    fn key(schema: &datafusion_common::DFSchema) -> Result<Expr> {
+        if schema.has_column_with_qualified_name(&"__merged".into(), "k") {
+            Ok(col("__merged.k"))
+        } else {
+            let (qualifier, field) = schema.qualified_field_with_unqualified_name("k")?;
+            Ok(Expr::Column(Column::new(qualifier.cloned(), field.name())))
+        }
+    }
+}
+
+impl RelationPlanner for MergedJoinPlanner {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn plan_join(
+        &self,
+        join: datafusion_expr::planner::RawSqlJoin,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<datafusion_expr::planner::JoinPlanning> {
+        use datafusion_expr::planner::JoinPlanning;
+        use datafusion_sql::sqlparser::ast::{JoinConstraint, JoinOperator};
+        let join_type = match &join.operator {
+            JoinOperator::FullOuter(JoinConstraint::Using(keys))
+                if keys.len() == 1 && keys[0].to_string() == "k" =>
+            {
+                JoinType::Full
+            }
+            JoinOperator::FullOuter(JoinConstraint::Natural) => JoinType::Full,
+            _ => return Ok(JoinPlanning::Original(Box::new(join))),
+        };
+        let left_key = Self::key(join.left.schema())?;
+        let right_key = Self::key(join.right.schema())?;
+        let merged = coalesce(vec![left_key.clone(), right_key.clone()])
+            .alias_qualified(Some("__merged"), "k");
+        let input = LogicalPlanBuilder::from(join.left)
+            .join_on(join.right, join_type, [left_key.eq(right_key)])?
+            .build()?;
+        let mut fields = vec![merged];
+        fields.extend(
+            input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|c| {
+                    c.relation
+                        .as_ref()
+                        .is_none_or(|r| r.to_string() != "__merged")
+                })
+                .map(Expr::Column),
+        );
+        let plan = LogicalPlanBuilder::from(input).project(fields)?.build()?;
+        Ok(JoinPlanning::Planned(Box::new(plan)))
+    }
+
+    fn plan_wildcard(
+        &self,
+        wildcard: &sqlparser::ast::SelectItem,
+        input: &datafusion_expr::LogicalPlan,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        use datafusion_sql::sqlparser::ast::SelectItem;
+        if !input
+            .schema()
+            .has_column_with_qualified_name(&"__merged".into(), "k")
+        {
+            return Ok(None);
+        }
+        let SelectItem::Wildcard(options) = wildcard else {
+            return Ok(None);
+        };
+        if options.opt_exclude.is_some()
+            || options.opt_except.is_some()
+            || options.opt_replace.is_some()
+            || options.opt_rename.is_some()
+            || options.opt_ilike.is_some()
+            || options.opt_alias.is_some()
+        {
+            return datafusion_common::plan_err!(
+                "Example merged-key planner requires a plain wildcard"
+            );
+        }
+        let mut fields = vec![col("__merged.k").alias("k")];
+        fields.extend(
+            input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|c| c.name != "k")
+                .map(Expr::Column),
+        );
+        Ok(Some(fields))
+    }
+}
+
+impl datafusion_expr::planner::ExprPlanner for MergedJoinPlanner {
+    fn plan_identifier(
+        &self,
+        identifier: &sqlparser::ast::Ident,
+        schema: &datafusion_common::DFSchema,
+        context: &mut dyn datafusion_expr::planner::IdentifierPlannerContext,
+    ) -> Result<Option<Expr>> {
+        if context.normalize_ident(identifier.clone()) == "k"
+            && schema.has_column_with_qualified_name(&"__merged".into(), "k")
+        {
+            Ok(Some(col("__merged.k")))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn join_wildcard_policy_execution() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    let mut ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+    ctx.register_relation_planner(Arc::new(MergedJoinPlanner))?;
+    ctx.register_expr_planner(Arc::new(MergedJoinPlanner))?;
+    let from = "FROM (VALUES (1, 10), (2, 20)) a(k, av) FULL JOIN (VALUES (2, 200), (3, 300)) b(k, bv) USING (k)";
+    let sql = format!("SELECT * {from} ORDER BY k");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----+-----+
+    | k | av | bv  |
+    +---+----+-----+
+    | 1 | 10 |     |
+    | 2 | 20 | 200 |
+    | 3 |    | 300 |
+    +---+----+-----+
+    ");
+    let sql = format!("SELECT k, a.k AS left_key, b.k AS right_key {from} WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----------+-----------+
+    | k | left_key | right_key |
+    +---+----------+-----------+
+    | 3 |          | 3         |
+    +---+----------+-----------+
+    ");
+    let sql = format!(
+        "SELECT * {from} FULL JOIN (VALUES (3, 3000), (4, 4000)) c(k, cv) USING (k) WHERE k >= 3 ORDER BY k"
+    );
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_snapshot!(batches_to_string(&batches), @r"
+    +---+----+-----+------+
+    | k | av | bv  | cv   |
+    +---+----+-----+------+
+    | 3 |    | 300 | 3000 |
+    | 4 |    |     | 4000 |
+    +---+----+-----+------+
+    ");
+    let sql = format!("SELECT a.* {from} WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(batches[0].num_columns(), 2);
+    assert_eq!(batches[0].column(0).null_count(), 1);
+    let sql = format!("SELECT * FROM (SELECT * {from}) derived WHERE k = 3");
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    let sql =
+        "SELECT * FROM (VALUES (1)) a(k) NATURAL FULL JOIN (VALUES (2)) b(k) ORDER BY k";
+    let batches = ctx.sql(sql).await?.collect().await?;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    assert!(
+        ctx.sql(&format!("SELECT * EXCLUDE (av) {from}"))
+            .await
+            .is_err()
+    );
+    // No hook accepts this ON join or its wildcard, so the default path is retained.
+    let batches = ctx
+        .sql("SELECT a.* FROM (VALUES (1)) a(k) JOIN (VALUES (1)) b(k) ON a.k = b.k")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batches[0].num_rows(), 1);
+    Ok(())
+}

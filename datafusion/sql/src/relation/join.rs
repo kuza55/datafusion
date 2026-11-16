@@ -2,11 +2,13 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use super::SqlToRelRelationContext;
 use crate::expr::reject_window_functions;
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{
     Column, HashMap, Result, not_impl_err, plan_datafusion_err, plan_err,
 };
+use datafusion_expr::planner::{JoinPlanning, RawSqlJoin};
 use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
@@ -47,7 +49,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         } else {
             self.create_relation(join.relation, planner_context)?
         };
-        match join.join_operator {
+        let mut raw = RawSqlJoin {
+            left,
+            right,
+            operator: join.join_operator,
+        };
+        for planner in self.context_provider.get_relation_planners() {
+            let mut context = SqlToRelRelationContext {
+                planner: self,
+                planner_context,
+            };
+            match planner.plan_join(raw, &mut context)? {
+                JoinPlanning::Planned(plan) => return Ok(*plan),
+                JoinPlanning::Original(join) => raw = *join,
+            }
+        }
+        let RawSqlJoin {
+            left,
+            right,
+            operator,
+        } = raw;
+        match operator {
             JoinOperator::LeftOuter(constraint) | JoinOperator::Left(constraint) => {
                 self.parse_join(left, right, constraint, JoinType::Left, planner_context)
             }

@@ -22,7 +22,7 @@ use datafusion_common::{
 };
 #[cfg(feature = "sql")]
 use sqlparser::ast::{
-    Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor,
+    Expr as SQLExpr, Ident, JoinOperator, ObjectName, SelectItem, TableAlias, TableFactor,
 };
 
 /// Provides the `SQL` query planner meta-data about tables and
@@ -469,12 +469,61 @@ pub enum RelationPlanning {
     Original(Box<TableFactor>),
 }
 
+/// SQL join inputs, planned once before extension dispatch.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct RawSqlJoin {
+    /// Left input, including the output of earlier joins in the FROM item.
+    pub left: LogicalPlan,
+    /// Right input, planned with the normal lateral/correlation context.
+    pub right: LogicalPlan,
+    /// SQL operator and its unresolved constraint.
+    pub operator: JoinOperator,
+}
+
+/// Result of a SQL join planning extension.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub enum JoinPlanning {
+    /// Supply the plan consumed by subsequent joins and SELECT clauses.
+    Planned(Box<LogicalPlan>),
+    /// Continue through registered planners and then built-in join planning.
+    Original(Box<RawSqlJoin>),
+}
+
 /// Customize planning SQL table factors to [`LogicalPlan`]s.
 #[cfg(feature = "sql")]
 /// For more background, please also see the [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Plan a join after both inputs, but before binding its SQL constraint.
+    ///
+    /// Extensions can project merged USING keys while retaining qualified source
+    /// fields. The returned schema is visible to later joins and identifier hooks.
+    fn plan_join(
+        &self,
+        join: RawSqlJoin,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<JoinPlanning> {
+        Ok(JoinPlanning::Original(Box::new(join)))
+    }
+
+    /// Expand a SELECT wildcard using the input plan's SQL-visible bindings.
+    ///
+    /// Only `Wildcard` and `QualifiedWildcard` items are passed here. The first
+    /// `Some` result replaces the complete item, including all its modifiers;
+    /// extensions must implement or reject modifiers they accept. `None` retains
+    /// built-in expansion. Returned expressions undergo normal projection checks.
+    fn plan_wildcard(
+        &self,
+        _wildcard: &SelectItem,
+        _input: &LogicalPlan,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        Ok(None)
+    }
+
     /// Plan a table factor into a [`LogicalPlan`].
     ///
     /// Returning [`RelationPlanning::Planned`] short-circuits further planning and uses the

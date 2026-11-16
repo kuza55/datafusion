@@ -1151,6 +1151,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let previous_clause = planner_context.identifier_clause;
         for (index, expr) in projection.into_iter().enumerate() {
             planner_context.identifier_clause = IdentifierClause::Select { index };
+            if matches!(
+                &expr,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            ) {
+                match self.plan_extension_wildcard(&expr, plan, planner_context) {
+                    Ok(Some(exprs)) => {
+                        prepared_select_exprs
+                            .extend(exprs.into_iter().map(SelectExpr::Expression));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        error_builder.add_error(err);
+                        continue;
+                    }
+                }
+            }
             match self.sql_select_to_rex(expr, plan, empty_from, planner_context) {
                 Ok(expr) => prepared_select_exprs.push(expr),
                 Err(err) => error_builder.add_error(err),
