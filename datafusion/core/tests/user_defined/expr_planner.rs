@@ -282,7 +282,7 @@ async fn identifier_planner_binds_query_local_aliases() -> Result<()> {
             vec![vec![1, 2], vec![3, 4]],
         ),
         (
-            "SELECT x AS a, (SELECT x) AS b FROM (VALUES (4)) t(x)",
+            "SELECT x AS a, (SELECT MAX(v) FROM (VALUES (4)) u(v) WHERE v = t.x) AS b FROM (VALUES (4)) t(x)",
             vec![vec![4, 4]],
         ),
         (
