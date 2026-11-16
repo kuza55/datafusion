@@ -645,6 +645,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         };
 
+        planner_context.identifier_clause = IdentifierClause::Other;
         // DISTRIBUTE BY
         let plan = if !select.distribute_by.is_empty() {
             let x = select
