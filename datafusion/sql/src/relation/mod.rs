@@ -18,7 +18,7 @@ use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
 
-mod join;
+pub(crate) mod join;
 
 struct SqlToRelRelationContext<'a, 'b, S: ContextProvider> {
     planner: &'a SqlToRel<'b, S>,

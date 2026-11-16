@@ -2304,7 +2304,13 @@ fn project_with_validation(
 
 /// Applies a wildcard's REPLACE statement, if it has one, to the columns the
 /// wildcard expanded to.
-fn apply_replace(
+///
+/// # Public Only for Internal Use:
+/// This is not a public API and is for internal use only; see [API policy] for details.
+///
+/// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+#[doc(hidden)]
+pub fn apply_replace(
     expanded: Vec<Expr>,
     replace: Option<&PlannedReplaceSelectItem>,
 ) -> Result<Vec<Expr>> {

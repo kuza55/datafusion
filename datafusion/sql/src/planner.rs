@@ -271,6 +271,9 @@ pub struct PlannerContext {
     pub(crate) identifier_clause: IdentifierClause,
     pub(crate) identifier_expansions: Vec<usize>,
     pub(crate) identifier_schema: Option<DFSchemaRef>,
+    pub(crate) identifier_input: Option<Arc<LogicalPlan>>,
+    pub(crate) join_bindings:
+        Vec<(DFSchemaRef, Vec<crate::relation::join::JoinColumnBinding>)>,
 }
 
 impl Default for PlannerContext {
@@ -294,6 +297,8 @@ impl PlannerContext {
             identifier_clause: IdentifierClause::Other,
             identifier_expansions: vec![],
             identifier_schema: None,
+            identifier_input: None,
+            join_bindings: vec![],
         }
     }
 

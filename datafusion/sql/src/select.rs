@@ -103,11 +103,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         );
         let expansions = std::mem::take(&mut planner_context.identifier_expansions);
         let schema = planner_context.identifier_schema.take();
+        let input = planner_context.identifier_input.take();
         let result = self.select_to_plan_inner(select, query_order_by, planner_context);
         planner_context.identifier_projection = projection;
         planner_context.identifier_clause = clause;
         planner_context.identifier_expansions = expansions;
         planner_context.identifier_schema = schema;
+        planner_context.identifier_input = input;
         result
     }
 
@@ -140,6 +142,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let plan = self.plan_from_tables(select.from, planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
         planner_context.identifier_schema = Some(Arc::clone(plan.schema()));
+        planner_context.identifier_input = Some(Arc::new(plan.clone()));
 
         planner_context.identifier_clause = IdentifierClause::Where;
         // Process `where` clause
@@ -1154,6 +1157,24 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let previous_clause = planner_context.identifier_clause;
         for (index, expr) in projection.into_iter().enumerate() {
             planner_context.identifier_clause = IdentifierClause::Select { index };
+            if matches!(
+                &expr,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            ) {
+                match self.plan_binding_wildcard(&expr, plan, empty_from, planner_context)
+                {
+                    Ok(Some(exprs)) => {
+                        prepared_select_exprs
+                            .extend(exprs.into_iter().map(SelectExpr::Expression));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        error_builder.add_error(err);
+                        continue;
+                    }
+                }
+            }
             match self.sql_select_to_rex(expr, plan, empty_from, planner_context) {
                 Ok(expr) => prepared_select_exprs.push(expr),
                 Err(err) => error_builder.add_error(err),
@@ -1161,6 +1182,138 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
         planner_context.identifier_clause = previous_clause;
         error_builder.error_or(prepared_select_exprs)
+    }
+
+    fn plan_binding_wildcard(
+        &self,
+        wildcard: &SelectItem,
+        plan: &LogicalPlan,
+        empty_from: bool,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Option<Vec<Expr>>> {
+        use datafusion_common::tree_node::Transformed;
+        use datafusion_expr::planner::{
+            ColumnBinding, ColumnBindingKind, WildcardLookup,
+        };
+        let planners = self.context_provider.get_relation_planners();
+        if planners.is_empty() {
+            return Ok(None);
+        }
+        let (qualifier, options) = match self.sql_select_to_rex(
+            wildcard.clone(),
+            plan,
+            empty_from,
+            planner_context,
+        )? {
+            SelectExpr::Wildcard(options) => (None, options),
+            SelectExpr::QualifiedWildcard(qualifier, options) => {
+                (Some(qualifier), options)
+            }
+            _ => unreachable!(),
+        };
+        let bindings = crate::relation::join::column_bindings(plan, planner_context)?;
+        let selected: Vec<_> = bindings
+            .iter()
+            .filter(|binding| match &qualifier {
+                Some(q) => binding
+                    .column
+                    .relation
+                    .as_ref()
+                    .is_some_and(|r| q.resolved_eq(r)),
+                None => binding.visible,
+            })
+            .collect();
+        if selected.is_empty() {
+            return plan_err!("Wildcard has no matching columns");
+        }
+        // Reuse engine modifier handling against the SQL-visible columns.
+        // This projection is a planning view, not an extra execution operator.
+        let projection = datafusion_expr::Projection::try_new(
+            selected
+                .iter()
+                .map(|binding| binding.expression.clone())
+                .collect(),
+            Arc::new(plan.clone()),
+        )?;
+        let columns = projection.schema.columns();
+        let view = LogicalPlan::Projection(projection);
+        let expanded = datafusion_expr::utils::expand_wildcard(
+            view.schema(),
+            &view,
+            Some(&options),
+        )?;
+        let expanded = datafusion_expr::logical_plan::builder::apply_replace(
+            expanded,
+            options.replace.as_ref(),
+        )?;
+        let output_columns = expanded
+            .iter()
+            .map(|expr| {
+                let (qualifier, name) = expr.qualified_name();
+                Column::new(qualifier, name)
+            })
+            .collect::<Vec<_>>();
+        let expressions = expanded
+            .into_iter()
+            .map(|expr| {
+                expr.transform_up(|expr| {
+                    if let Expr::Column(column) = &expr
+                        && let Some(index) = columns.iter().position(|c| c == column)
+                    {
+                        return Ok(Transformed::yes(
+                            selected[index].expression.clone().unalias(),
+                        ));
+                    }
+                    Ok(Transformed::no(expr))
+                })
+                .map(|expr| expr.data)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let candidates: Vec<_> = output_columns
+            .into_iter()
+            .map(|column| {
+                let kind = selected
+                    .iter()
+                    .find(|binding| binding.column == column)
+                    .map_or(ColumnBindingKind::Input, |binding| binding.kind);
+                ColumnBinding::new(column, kind)
+            })
+            .collect();
+        let request = WildcardLookup::new(qualifier.as_ref(), &candidates);
+        for planner in planners {
+            if let Some(ids) = planner.expand_wildcard(&request)? {
+                if ids.is_empty() {
+                    return plan_err!("Wildcard selection is empty");
+                }
+                let mut seen = HashSet::new();
+                let mut result = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if !seen.insert(id) {
+                        return plan_err!("Wildcard binding selected more than once");
+                    }
+                    let index = candidates
+                        .iter()
+                        .position(|candidate| candidate.id() == id)
+                        .ok_or_else(|| {
+                            datafusion_common::plan_datafusion_err!(
+                                "Wildcard binding does not belong to this lookup"
+                            )
+                        })?;
+                    let expr = expressions[index].clone();
+                    let column = candidates[index].column();
+                    let expr = match &expr {
+                        Expr::Column(c) if c == column => expr,
+                        _ => expr.alias_qualified(
+                            column.relation.clone(),
+                            column.name.clone(),
+                        ),
+                    };
+                    result.push(expr);
+                }
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
     }
 
     /// Generate a relational expression from a select SQL expression

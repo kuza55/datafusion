@@ -17,6 +17,7 @@ use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
+use datafusion_expr::registry::FunctionRegistry;
 use datafusion_sql::sqlparser::ast::{TableAlias, TableFactor};
 use insta::assert_snapshot;
 
@@ -726,4 +727,301 @@ mod tests {
         +--------+-------+
         ");
     }
+}
+
+#[derive(Debug)]
+struct JoinedColumns;
+
+impl datafusion_expr::planner::ExprPlanner for JoinedColumns {
+    fn resolve_column(
+        &self,
+        request: &datafusion_expr::planner::ColumnLookup<'_>,
+    ) -> Result<Option<datafusion_expr::planner::BindingId>> {
+        use datafusion_expr::planner::ColumnBindingKind;
+        if request.clause() == datafusion_expr::planner::IdentifierClause::OrderBy
+            && let Some(output) = request.candidates().iter().find(|binding| {
+                binding.kind() == ColumnBindingKind::Input
+                    && binding.column().relation.is_none()
+            })
+        {
+            return Ok(Some(output.id()));
+        }
+        let merged: Vec<_> = request
+            .candidates()
+            .iter()
+            .filter(|binding| binding.kind() == ColumnBindingKind::Using)
+            .collect();
+        if merged.is_empty() {
+            if request
+                .candidates()
+                .iter()
+                .all(|binding| matches!(binding.kind(), ColumnBindingKind::Outer { .. }))
+            {
+                return Ok(request
+                    .candidates()
+                    .iter()
+                    .find(|binding| binding.column().relation.is_none())
+                    .map(|binding| binding.id()));
+            }
+            return Ok(match request.candidates() {
+                [binding] if binding.kind() == ColumnBindingKind::Input => {
+                    Some(binding.id())
+                }
+                _ => None,
+            });
+        }
+        if merged.len() != 1
+            || request.candidates().iter().any(|binding| {
+                binding.kind() == ColumnBindingKind::Input
+                    && binding.column().relation.is_some()
+            })
+        {
+            return datafusion_common::plan_err!("Ambiguous merged column");
+        }
+        Ok(Some(merged[0].id()))
+    }
+}
+
+impl RelationPlanner for JoinedColumns {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn expand_wildcard(
+        &self,
+        request: &datafusion_expr::planner::WildcardLookup<'_>,
+    ) -> Result<Option<Vec<datafusion_expr::planner::BindingId>>> {
+        Ok(Some(
+            request
+                .columns()
+                .iter()
+                .map(|binding| binding.id())
+                .collect(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn joined_bindings_preserve_keys_scopes_and_modifiers() -> Result<()> {
+    for optimize in [false, true] {
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features();
+        let state = if optimize {
+            state
+        } else {
+            state.with_optimizer_rules(vec![])
+        };
+        let mut ctx = SessionContext::new_with_state(state.build());
+        ctx.register_expr_planner(Arc::new(JoinedColumns))?;
+        ctx.register_relation_planner(Arc::new(JoinedColumns))?;
+        for (sql, expected) in [
+            (
+                "SELECT k, a.k AS ak, b.k AS bk FROM (VALUES (1)) a(k) RIGHT JOIN (VALUES (2)) b(k) USING(k)",
+                vec![vec![Some(2), None, Some(2)]],
+            ),
+            (
+                "SELECT k, COUNT(*) AS n FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) GROUP BY k HAVING k > 1 ORDER BY k",
+                vec![vec![Some(2), Some(1)]],
+            ),
+            (
+                "SELECT k, ROW_NUMBER() OVER (ORDER BY k) AS rn FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) QUALIFY rn = 2",
+                vec![vec![Some(2), Some(2)]],
+            ),
+            (
+                "SELECT k, a.k AS ak, b.k AS bk FROM (VALUES (1), (2)) a(k) FULL JOIN (VALUES (2), (3)) b(k) USING(k) ORDER BY k",
+                vec![
+                    vec![Some(1), Some(1), None],
+                    vec![Some(2), Some(2), Some(2)],
+                    vec![Some(3), None, Some(3)],
+                ],
+            ),
+            (
+                "SELECT * FROM (VALUES (10, 1)) z(x,k) FULL JOIN (VALUES (2, 20)) a(k,y) USING(k) ORDER BY k",
+                vec![vec![Some(1), Some(10), None], vec![Some(2), None, Some(20)]],
+            ),
+            (
+                "SELECT k FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) JOIN (VALUES (2)) c(k) USING(k)",
+                vec![vec![Some(2)]],
+            ),
+            (
+                "SELECT k FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) JOIN (VALUES (2)) c(v) ON k = c.v",
+                vec![vec![Some(2)]],
+            ),
+            (
+                "SELECT k FROM ((VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k)) NATURAL JOIN ((VALUES (2)) c(k) FULL JOIN (VALUES (3)) d(k) USING(k))",
+                vec![vec![Some(2)]],
+            ),
+            (
+                "SELECT k FROM (VALUES (1)) a(k) NATURAL FULL JOIN (VALUES (2)) b(k) WHERE k > 1",
+                vec![vec![Some(2)]],
+            ),
+            (
+                "SELECT a.* FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) WHERE k = 2",
+                vec![vec![None]],
+            ),
+            (
+                "SELECT * EXCLUDE(x) FROM (VALUES (1, 10)) a(k,x) FULL JOIN (VALUES (2, 20)) b(k,y) USING(k) ORDER BY k",
+                vec![vec![Some(1), None], vec![Some(2), Some(20)]],
+            ),
+            (
+                "SELECT * REPLACE(k + 10 AS k) FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) ORDER BY k",
+                vec![vec![Some(11)], vec![Some(12)]],
+            ),
+            (
+                "SELECT q.k FROM (SELECT * FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k)) q ORDER BY q.k",
+                vec![vec![Some(1)], vec![Some(2)]],
+            ),
+        ] {
+            let batches = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("optimize={optimize}: {sql}: {e}"))
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("optimize={optimize}: {sql}: {e}"));
+            let mut actual = vec![];
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    actual.push(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                match ScalarValue::try_from_array(column, row).unwrap() {
+                                    ScalarValue::Int64(value) => value,
+                                    ScalarValue::UInt64(value) => {
+                                        value.map(|v| i64::try_from(v).unwrap())
+                                    }
+                                    other => panic!("{sql}: {other:?}"),
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            assert_eq!(actual, expected, "optimize={optimize}: {sql}");
+        }
+        if optimize {
+            let batches = ctx.sql("SELECT k FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) WHERE EXISTS (SELECT 1 FROM (VALUES (2)) c(v) WHERE v = k)").await?.collect().await?;
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0)?,
+                ScalarValue::Int64(Some(2))
+            );
+        }
+        for sql in [
+            "SELECT k FROM (VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k) CROSS JOIN (VALUES (3)) c(k)",
+            "SELECT a.k FROM (SELECT * FROM (VALUES (1)) a(k) JOIN (VALUES (1)) b(k) USING(k)) q",
+        ] {
+            assert!(ctx.sql(sql).await.is_err(), "{sql}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StaleWildcardBinding(
+    std::sync::Mutex<Option<datafusion_expr::planner::BindingId>>,
+);
+
+impl RelationPlanner for StaleWildcardBinding {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn expand_wildcard(
+        &self,
+        request: &datafusion_expr::planner::WildcardLookup<'_>,
+    ) -> Result<Option<Vec<datafusion_expr::planner::BindingId>>> {
+        let mut previous = self.0.lock().unwrap();
+        if let Some(id) = *previous {
+            return Ok(Some(vec![id]));
+        }
+        *previous = request.columns().first().map(|binding| binding.id());
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn wildcard_bindings_reject_ids_from_another_query() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(StaleWildcardBinding::default()))?;
+    ctx.sql("SELECT * FROM (VALUES (1)) t(x)")
+        .await?
+        .collect()
+        .await?;
+    let error = ctx
+        .sql("SELECT * FROM (VALUES (2)) t(x)")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not belong to this lookup"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct WildcardSelection(Vec<usize>);
+
+impl RelationPlanner for WildcardSelection {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn expand_wildcard(
+        &self,
+        request: &datafusion_expr::planner::WildcardLookup<'_>,
+    ) -> Result<Option<Vec<datafusion_expr::planner::BindingId>>> {
+        Ok(Some(
+            self.0
+                .iter()
+                .map(|index| request.columns()[*index].id())
+                .collect(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn wildcard_selection_orders_columns_and_validates_ids() -> Result<()> {
+    for (indices, error) in [
+        (vec![1, 0], None),
+        (vec![0, 0], Some("selected more than once")),
+        (vec![], Some("selection is empty")),
+    ] {
+        let ctx = SessionContext::new();
+        ctx.register_relation_planner(Arc::new(WildcardSelection(indices)))?;
+        let result = ctx.sql("SELECT * FROM (VALUES (1, 2)) t(x, y)").await;
+        if let Some(message) = error {
+            assert!(result.unwrap_err().to_string().contains(message));
+        } else {
+            let batches = result?.collect().await?;
+            assert_eq!(
+                batches[0]
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                ["y", "x"]
+            );
+            assert_eq!(
+                ScalarValue::try_from_array(batches[0].column(0), 0)?,
+                ScalarValue::Int64(Some(2))
+            );
+        }
+    }
+    Ok(())
 }

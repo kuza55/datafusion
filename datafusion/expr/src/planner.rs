@@ -344,6 +344,10 @@ pub struct BindingId(u64);
 pub enum ColumnBindingKind {
     /// A column in the current input.
     Input,
+    /// An original qualified key hidden from an unqualified USING wildcard.
+    UsingInput,
+    /// The merged unqualified output of a USING or NATURAL join.
+    Using,
     /// An explicitly named SELECT expression, before wildcard expansion.
     SelectAlias { index: usize },
     /// A correlated column; depth zero is the nearest outer query.
@@ -434,6 +438,41 @@ impl<'a> ColumnLookup<'a> {
             clause,
             candidates,
         }
+    }
+}
+
+/// Engine-expanded wildcard columns after built-in modifiers. A hook can select
+/// and reorder these bindings, but cannot supply expressions or change the input.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct WildcardLookup<'a> {
+    qualifier: Option<&'a TableReference>,
+    columns: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> WildcardLookup<'a> {
+    /// Relation selected by `t.*`, or `None` for `*`.
+    pub fn qualifier(&self) -> Option<&TableReference> {
+        self.qualifier
+    }
+    /// Eligible columns in the engine's SQL output order.
+    pub fn columns(&self) -> &[ColumnBinding] {
+        self.columns
+    }
+
+    /// Construct an engine-expanded wildcard request.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        qualifier: Option<&'a TableReference>,
+        columns: &'a [ColumnBinding],
+    ) -> Self {
+        Self { qualifier, columns }
     }
 }
 
@@ -550,6 +589,16 @@ pub enum RelationPlanning {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Select and order engine-expanded wildcard bindings. `None` preserves them.
+    /// Returned IDs must belong to this request and may not repeat.
+    #[cfg(feature = "sql")]
+    fn expand_wildcard(
+        &self,
+        _request: &WildcardLookup<'_>,
+    ) -> Result<Option<Vec<BindingId>>> {
+        Ok(None)
+    }
+
     /// Plan a table factor into a [`LogicalPlan`].
     ///
     /// Returning [`RelationPlanning::Planned`] short-circuits further planning and uses the

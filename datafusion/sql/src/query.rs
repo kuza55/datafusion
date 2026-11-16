@@ -34,6 +34,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             datafusion_expr::planner::IdentifierClause::Other;
         query_plan_context.identifier_expansions.clear();
         query_plan_context.identifier_schema = None;
+        if let Some(input) = query_plan_context.identifier_input.take()
+            && let Some(outer) = query_plan_context.latest_outer_query_schema()
+            && input.schema().as_ref() == outer.as_ref()
+        {
+            let bindings =
+                crate::relation::join::column_bindings(&input, &query_plan_context)?;
+            query_plan_context
+                .join_bindings
+                .push((Arc::clone(outer), bindings));
+        }
         let planner_context = &mut query_plan_context;
 
         let Query {

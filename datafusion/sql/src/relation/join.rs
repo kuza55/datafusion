@@ -7,11 +7,102 @@ use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{
     Column, HashMap, Result, not_impl_err, plan_datafusion_err, plan_err,
 };
+use datafusion_expr::planner::ColumnBindingKind;
+use datafusion_expr::{Case, Expr};
 use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
+
+#[derive(Debug, Clone)]
+pub(crate) struct JoinColumnBinding {
+    pub column: Column,
+    pub expression: Expr,
+    pub kind: ColumnBindingKind,
+    pub visible: bool,
+}
+
+pub(crate) fn column_bindings(
+    plan: &LogicalPlan,
+    context: &PlannerContext,
+) -> Result<Vec<JoinColumnBinding>> {
+    if let Some((_, bindings)) = context
+        .join_bindings
+        .iter()
+        .find(|(schema, _)| Arc::ptr_eq(schema, plan.schema()))
+    {
+        return Ok(bindings.clone());
+    }
+    match plan {
+        LogicalPlan::Filter(filter) => column_bindings(&filter.input, context),
+        LogicalPlan::Join(join) => {
+            let mut left = column_bindings(&join.left, context)?;
+            let mut right = column_bindings(&join.right, context)?;
+            if matches!(join.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                return Ok(left);
+            }
+            if matches!(join.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+                return Ok(right);
+            }
+            let mut merged = vec![];
+            if join.join_constraint == datafusion_expr::JoinConstraint::Using {
+                for (left_key, right_key) in &join.on {
+                    let name = match left_key {
+                        Expr::Column(column) => column.name.clone(),
+                        Expr::Alias(alias) => alias.name.clone(),
+                        _ => continue,
+                    };
+                    let expression = match join.join_type {
+                        JoinType::Right => right_key.clone().unalias(),
+                        JoinType::Full => Expr::Case(Case::new(
+                            None,
+                            vec![(
+                                Box::new(left_key.clone().unalias().is_not_null()),
+                                Box::new(left_key.clone().unalias()),
+                            )],
+                            Some(Box::new(right_key.clone().unalias())),
+                        )),
+                        _ => left_key.clone().unalias(),
+                    }
+                    .alias(name.clone());
+                    for binding in left.iter_mut().chain(right.iter_mut()) {
+                        if binding.column.name == name {
+                            binding.visible = false;
+                            if binding.column.relation.is_some() {
+                                binding.kind = ColumnBindingKind::UsingInput;
+                            }
+                        }
+                    }
+                    merged.push(JoinColumnBinding {
+                        column: Column::from_name(name),
+                        expression,
+                        kind: ColumnBindingKind::Using,
+                        visible: true,
+                    });
+                }
+            }
+            merged.extend(
+                left.into_iter().chain(right).filter(|binding| {
+                    binding.visible || binding.column.relation.is_some()
+                }),
+            );
+            Ok(merged)
+        }
+        _ => Ok(plan
+            .schema()
+            .columns()
+            .into_iter()
+            .map(|column| JoinColumnBinding {
+                expression: Expr::Column(column.clone()),
+                column,
+                kind: ColumnBindingKind::Input,
+                visible: true,
+            })
+            .collect()),
+    }
+}
 
 const JOIN_ON_HELP: &str =
     "Compute the window function in a subquery and join on its result";
@@ -170,6 +261,88 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         LogicalPlanBuilder::from(left).cross_join(right)?.build()
     }
 
+    fn plan_using_bindings(
+        &self,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        join_type: JoinType,
+        keys: Vec<Column>,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        use datafusion_expr::expr_rewriter::normalize_col;
+        let previous_input = planner_context.identifier_input.take();
+        let projection =
+            std::mem::replace(&mut planner_context.identifier_projection, Arc::from([]));
+        let result = (|| {
+            let mut handled = false;
+            let mut on = vec![];
+            for key in &keys {
+                let mut expressions = vec![];
+                for input in [&left, &right] {
+                    planner_context.identifier_input = Some(Arc::new(input.clone()));
+                    // The SQL name is already normalized; quoting prevents normalizing it again.
+                    let id = sqlparser::ast::Ident::with_quote('"', key.name.clone());
+                    let expr = self.resolve_column_reference(
+                        &[id],
+                        input.schema(),
+                        planner_context,
+                    )?;
+                    handled |= expr.is_some();
+                    expressions.push(match expr {
+                        Some(expr) => expr.unalias().alias(key.name.clone()),
+                        None => normalize_col(Expr::Column(key.clone()), input)?,
+                    });
+                }
+                let right = expressions.pop().unwrap();
+                on.push((expressions.pop().unwrap(), right));
+            }
+            Ok::<_, datafusion_common::DataFusionError>((handled, on))
+        })();
+        planner_context.identifier_input = previous_input;
+        planner_context.identifier_projection = projection;
+        let (handled, on) = result?;
+        if !handled {
+            return LogicalPlanBuilder::from(left)
+                .join_using(right, join_type, keys)?
+                .build();
+        }
+        let mut join = datafusion_expr::Join::try_new(
+            Arc::new(left),
+            Arc::new(right),
+            on,
+            None,
+            join_type,
+            datafusion_expr::JoinConstraint::Using,
+            datafusion_common::NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        if join.on.iter().all(|(left, right)| {
+            matches!(left.clone().unalias(), Expr::Column(_))
+                && matches!(right.clone().unalias(), Expr::Column(_))
+        }) {
+            join.on = join
+                .on
+                .into_iter()
+                .map(|(left, right)| (left.unalias(), right.unalias()))
+                .collect();
+            return Ok(LogicalPlan::Join(join));
+        }
+        let bindings =
+            column_bindings(&LogicalPlan::Join(join.clone()), planner_context)?;
+        // The logical USING representation requires column keys. Lower selected
+        // merged expressions to ON, retaining SQL visibility only while binding.
+        join.join_constraint = datafusion_expr::JoinConstraint::On;
+        join.on = join
+            .on
+            .into_iter()
+            .map(|(left, right)| (left.unalias(), right.unalias()))
+            .collect();
+        planner_context
+            .join_bindings
+            .push((Arc::clone(&join.schema), bindings));
+        Ok(LogicalPlan::Join(join))
+    }
+
     fn parse_join(
         &self,
         left: LogicalPlan,
@@ -184,7 +357,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 // parse ON expression
                 self.warn_on_null_equality_predicate(&sql_expr);
                 let window_span = self.window_function_span(&sql_expr, &HashMap::new());
-                let expr = self.sql_to_expr(sql_expr, &join_schema, planner_context)?;
+                let input = LogicalPlanBuilder::from(left.clone())
+                    .cross_join(right.clone())?
+                    .build()?;
+                let previous_input =
+                    planner_context.identifier_input.replace(Arc::new(input));
+                let result = self.sql_to_expr(sql_expr, &join_schema, planner_context);
+                planner_context.identifier_input = previous_input;
+                let expr = result?;
                 // A join condition is evaluated before window functions are
                 // computed, so they may not appear in it
                 reject_window_functions(&expr, "JOIN ON", JOIN_ON_HELP, window_span)?;
@@ -214,27 +394,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                LogicalPlanBuilder::from(left)
-                    .join_using(right, join_type, keys)?
-                    .build()
+                self.plan_using_bindings(left, right, join_type, keys, planner_context)
             }
             JoinConstraint::Natural => {
                 let left_cols: HashSet<&String> =
                     left.schema().fields().iter().map(|f| f.name()).collect();
+                let mut seen = HashSet::new();
                 let keys: Vec<Column> = right
                     .schema()
                     .fields()
                     .iter()
                     .map(|f| f.name())
-                    .filter(|f| left_cols.contains(f))
+                    .filter(|f| left_cols.contains(f) && seen.insert(*f))
                     .map(Column::from_name)
                     .collect();
                 if keys.is_empty() {
                     self.parse_cross_join(left, right)
                 } else {
-                    LogicalPlanBuilder::from(left)
-                        .join_using(right, join_type, keys)?
-                        .build()
+                    self.plan_using_bindings(
+                        left,
+                        right,
+                        join_type,
+                        keys,
+                        planner_context,
+                    )
                 }
             }
             JoinConstraint::None => LogicalPlanBuilder::from(left)

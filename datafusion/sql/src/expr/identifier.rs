@@ -5,7 +5,7 @@
 use arrow::datatypes::FieldRef;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::{
-    Column, DFSchema, Result, Span, TableReference, assert_or_internal_err,
+    Column, DFSchema, ExprSchema, Result, Span, TableReference, assert_or_internal_err,
     exec_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr::expr::LambdaVariable;
@@ -44,9 +44,36 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let mut candidates = vec![];
         let mut expressions = vec![];
+        if let Some(input) = &planner_context.identifier_input
+            && matches!(
+                input.as_ref(),
+                datafusion_expr::LogicalPlan::Join(_)
+                    | datafusion_expr::LogicalPlan::Filter(_)
+            )
+        {
+            for binding in crate::relation::join::column_bindings(input, planner_context)?
+            {
+                if matches(&binding.column)
+                    && (binding.visible || binding.column.relation.is_some())
+                    && binding
+                        .expression
+                        .column_refs()
+                        .iter()
+                        .all(|column| schema.has_column(column))
+                {
+                    candidates.push(ColumnBinding::new(binding.column, binding.kind));
+                    expressions.push(Some(binding.expression));
+                }
+            }
+        }
         for (q, field) in schema.qualified_fields_with_unqualified_name(name) {
             let column = Column::from((q, field));
-            if matches(&column) {
+            if matches(&column)
+                && !candidates.iter().any(|binding| {
+                    binding.column() == &column
+                        && binding.kind() != ColumnBindingKind::Using
+                })
+            {
                 candidates
                     .push(ColumnBinding::new(column.clone(), ColumnBindingKind::Input));
                 expressions.push(Some(Expr::Column(column)));
@@ -67,6 +94,36 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         }
         for (depth, outer) in planner_context.outer_schemas_iter().enumerate() {
+            if let Some((_, bindings)) = planner_context
+                .join_bindings
+                .iter()
+                .find(|(schema, _)| Arc::ptr_eq(schema, outer))
+            {
+                use datafusion_common::tree_node::{Transformed, TreeNode};
+                for binding in bindings.iter().filter(|binding| {
+                    binding.kind == ColumnBindingKind::Using && matches(&binding.column)
+                }) {
+                    let expr = binding
+                        .expression
+                        .clone()
+                        .transform_up(|expr| {
+                            if let Expr::Column(column) = expr {
+                                let field = Arc::clone(outer.field_from_column(&column)?);
+                                Ok(Transformed::yes(Expr::OuterReferenceColumn(
+                                    field, column,
+                                )))
+                            } else {
+                                Ok(Transformed::no(expr))
+                            }
+                        })?
+                        .data;
+                    candidates.push(ColumnBinding::new(
+                        binding.column.clone(),
+                        ColumnBindingKind::Outer { depth },
+                    ));
+                    expressions.push(Some(expr));
+                }
+            }
             for (q, field) in outer.qualified_fields_with_unqualified_name(name) {
                 let column = Column::from((q, field));
                 if matches(&column) {
