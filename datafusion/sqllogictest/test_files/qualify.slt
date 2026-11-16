@@ -413,3 +413,53 @@ SELECT id, random() AS r FROM users QUALIFY r > 0.5;
 # Clean up
 statement ok
 DROP TABLE users;
+
+# Regression of #21173: SELECT windows must be checked before rebasing.
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY x) AS rn
+FROM (VALUES (1), (2)) t(x) QUALIFY x = 2;
+----
+2
+
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY x) AS rn
+FROM (VALUES (1), (2)) t(x) QUALIFY TRUE ORDER BY rn;
+----
+1
+2
+
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY x) AS rn
+FROM (VALUES (1), (2)) t(x) QUALIFY FALSE;
+----
+
+# The source column wins the alias collision; the SELECT still has a window.
+query I
+SELECT ROW_NUMBER() OVER (ORDER BY x DESC) AS x
+FROM (VALUES (1), (2)) t(x) QUALIFY x = 1;
+----
+2
+
+query II
+SELECT x, ROW_NUMBER() OVER (ORDER BY SUM(v)) AS rn
+FROM (VALUES (1, 10), (2, 20)) t(x, v)
+GROUP BY x QUALIFY SUM(v) > 10;
+----
+2 2
+
+# A window exclusively in ORDER BY cannot make QUALIFY valid.
+statement error QUALIFY clause requires window functions in the SELECT list or QUALIFY clause
+SELECT x FROM (VALUES (1), (2)) t(x)
+QUALIFY TRUE ORDER BY ROW_NUMBER() OVER (ORDER BY x);
+
+# This also applies when the predicate is deferred for a volatile alias.
+statement error QUALIFY clause requires window functions in the SELECT list or QUALIFY clause
+SELECT random() AS r FROM (VALUES (1), (2)) t(x)
+QUALIFY r >= 0 ORDER BY ROW_NUMBER() OVER (ORDER BY x);
+
+query IB
+SELECT ROW_NUMBER() OVER (ORDER BY x) AS rn, random() >= 0 AS r
+FROM (VALUES (1), (2)) t(x) QUALIFY r ORDER BY rn;
+----
+1 true
+2 true

@@ -440,6 +440,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             plan
         };
 
+        // Validate before rebasing SELECT windows to columns. ORDER BY and
+        // DISTINCT ON windows do not satisfy QUALIFY's window requirement.
+        if (qualify_expr_post_aggr.is_some() || qualify_post_projection.is_some())
+            && find_window_exprs(
+                select_exprs_post_aggr
+                    .iter()
+                    .chain(qualify_expr_post_aggr.iter())
+                    .chain(qualify_post_projection.iter()),
+            )
+            .is_empty()
+        {
+            return plan_err!(
+                "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
+            );
+        }
+
         // All of the window expressions (deduplicated and rewritten to reference aggregates as
         // columns from input). Window functions may be sourced from the SELECT list, QUALIFY
         // expression, ORDER BY, or DISTINCT ON.
@@ -486,18 +502,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Process QUALIFY clause after window functions
         // QUALIFY filters the results of window functions, similar to how HAVING filters aggregates
         let plan = if let Some(qualify_expr) = qualify_expr_post_aggr {
-            // Validate that QUALIFY is used with window functions in SELECT or QUALIFY
-            let qualify_window_func_exprs = find_window_exprs(
-                select_exprs_post_aggr
-                    .iter()
-                    .chain(std::iter::once(&qualify_expr)),
-            );
-            if qualify_window_func_exprs.is_empty() {
-                return plan_err!(
-                    "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
-                );
-            }
-
             // now attempt to resolve columns and replace with fully-qualified columns
             let windows_projection_exprs = window_func_exprs
                 .iter()
@@ -520,19 +524,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         } else {
             plan
         };
-
-        // A QUALIFY that was deferred to a post-projection filter still
-        // requires window functions elsewhere in the query. A window function
-        // inside the deferred predicate itself is rejected later with a more
-        // specific error, so it is not counted here.
-        if let Some(qualify_expr) = &qualify_post_projection
-            && window_func_exprs.is_empty()
-            && find_window_exprs(std::iter::once(qualify_expr)).is_empty()
-        {
-            return plan_err!(
-                "QUALIFY clause requires window functions in the SELECT list or QUALIFY clause"
-            );
-        }
 
         // Process distinct clause. For `DISTINCT ON` combined with
         // aggregation, GROUP BY, or window functions we apply DistinctOn
