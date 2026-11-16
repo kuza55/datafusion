@@ -76,13 +76,13 @@ ORDER BY from the deferred-volatile path.
 
 Rust 1.99.1, on the combined validation commit linked above:
 
-| Check | Result |
-| --- | --- |
-| Focused expression-planner execution tests | 10 passed |
-| Extended workspace suite | 13,455 Rust tests passed, 8 ignored; all 307 SQL logic files passed |
-| `cargo fmt --all -- --check` | Passed |
-| `cargo clippy --all-targets --all-features -- -D warnings` | Passed |
-| Nonfunctional suite | All steps passed; the final HTML-docs step was rerun after installing Graphviz and cargo-depgraph |
+| Check                                                      | Result                                                                                            |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Focused expression-planner execution tests                 | 10 passed                                                                                         |
+| Extended workspace suite                                   | 13,455 Rust tests passed, 8 ignored; all 307 SQL logic files passed                               |
+| `cargo fmt --all -- --check`                               | Passed                                                                                            |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Passed                                                                                            |
+| Nonfunctional suite                                        | All steps passed; the final HTML-docs step was rerun after installing Graphviz and cargo-depgraph |
 
 The extended suite used:
 
@@ -98,12 +98,12 @@ unoptimized `ci` profile, 30 samples, a 2-second warmup and 5-second measurement
 The table shows Criterion's point estimates from the repeat after the test suite
 finished; the first run overlapped fuzz tests and was discarded as noisy.
 
-| Benchmark | Main | Combined hooks |
-| --- | --- | --- |
-| `logical_select_one_from_700` | 1.841 ms | 1.718 ms |
-| `logical_select_all_from_1000` | 23.721 ms | 16.397 ms |
-| `logical_wide_case_50_exprs` | 10.326 ms | 8.103 ms |
-| `optimizer_select_one_from_700` (unchanged control) | 1.673 ms | 1.584 ms |
+| Benchmark                                           | Main      | Combined hooks |
+| --------------------------------------------------- | --------- | -------------- |
+| `logical_select_one_from_700`                       | 1.841 ms  | 1.718 ms       |
+| `logical_select_all_from_1000`                      | 23.721 ms | 16.397 ms      |
+| `logical_wide_case_50_exprs`                        | 10.326 ms | 8.103 ms       |
+| `optimizer_select_one_from_700` (unchanged control) | 1.673 ms  | 1.584 ms       |
 
 The unchanged optimizer control also shifted. These are shared-runner smoke
 measurements; release-build overhead remains unmeasured.
