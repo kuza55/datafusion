@@ -21,12 +21,13 @@ use datafusion_common::{
     plan_datafusion_err,
 };
 use datafusion_expr::Expr;
+use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
 use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
-use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
+use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, SelectItem, TableAlias};
 
 /// SQL parser options
 #[derive(Debug, Clone, Copy)]
@@ -264,6 +265,9 @@ pub struct PlannerContext {
     set_expr_left_schema: Option<DFSchemaRef>,
     /// The parameters of all lambdas seen so far
     lambda_parameters: HashMap<String, FieldRef>,
+    pub(crate) identifier_projection: Arc<[SelectItem]>,
+    pub(crate) identifier_clause: IdentifierClause,
+    pub(crate) identifier_expansions: Vec<String>,
 }
 
 impl Default for PlannerContext {
@@ -283,6 +287,9 @@ impl PlannerContext {
             create_table_schema: None,
             set_expr_left_schema: None,
             lambda_parameters: HashMap::new(),
+            identifier_projection: Arc::from([]),
+            identifier_clause: IdentifierClause::Other,
+            identifier_expansions: vec![],
         }
     }
 

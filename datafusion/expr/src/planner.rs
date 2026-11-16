@@ -21,7 +21,7 @@ use datafusion_common::{
     file_options::file_type::FileType, not_impl_err,
 };
 #[cfg(feature = "sql")]
-use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor};
+use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor};
 
 /// Provides the `SQL` query planner meta-data about tables and
 /// functions referenced in SQL statements, without a direct dependency on the
@@ -141,6 +141,21 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
+    /// Plan a bare identifier after lambda/variable lookup and before column lookup.
+    ///
+    /// Return `None` to preserve normal resolution. Implementations own precedence
+    /// and ambiguity policy; use `schema` and the outer schemas before substituting
+    /// aliases. Qualified identifiers use the existing compound-identifier path.
+    #[cfg(feature = "sql")]
+    fn plan_identifier(
+        &self,
+        _identifier: &Ident,
+        _schema: &DFSchema,
+        _context: &mut dyn IdentifierPlannerContext,
+    ) -> Result<Option<Expr>> {
+        Ok(None)
+    }
+
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -292,6 +307,54 @@ pub trait ExprPlanner: Debug + Send + Sync {
     fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
         Ok(PlannerResult::Original(expr))
     }
+}
+
+/// SQL clause containing the identifier being planned.
+///
+/// Window arguments inherit their containing clause. `From` includes join
+/// predicates and table-function arguments; nested queries have their own scope.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdentifierClause {
+    /// A projection item, indexed before wildcard expansion.
+    Select { index: usize },
+    /// FROM relations, join predicates and table-function arguments.
+    From,
+    /// WHERE predicate.
+    Where,
+    /// GROUP BY expression.
+    GroupBy,
+    /// HAVING predicate.
+    Having,
+    /// QUALIFY predicate.
+    Qualify,
+    /// ORDER BY expression.
+    OrderBy,
+    /// An expression outside the clauses above.
+    Other,
+}
+
+/// Query-local context for [`ExprPlanner::plan_identifier`].
+///
+/// This interface exposes binding inputs, not an alias materialization mechanism.
+/// Substituting volatile expressions can change evaluation counts; extensions
+/// must materialize them elsewhere or reject such substitutions.
+#[cfg(feature = "sql")]
+pub trait IdentifierPlannerContext {
+    /// Projection of the current SELECT, without projections from outer queries.
+    fn projection(&self) -> &[SelectItem];
+    /// Clause in which the identifier occurs.
+    fn clause(&self) -> IdentifierClause;
+    /// Outer query schemas, ordered from outermost to innermost.
+    fn outer_query_schemas(&self) -> &[datafusion_common::DFSchemaRef];
+    /// Normalize an identifier using the current parser options.
+    fn normalize_ident(&self, identifier: Ident) -> String;
+    /// Plan a replacement in the current expression's schema and scope.
+    ///
+    /// Re-entering this method for the same identifier in the same SELECT
+    /// produces a cycle error. Subqueries receive independent binding scopes.
+    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr>;
 }
 
 /// An operator with two arguments to plan

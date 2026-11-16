@@ -27,6 +27,7 @@ use datafusion_common::{
 };
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
+use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::Unnest as UnnestExpr;
 use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
@@ -88,6 +89,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Generate a logic plan from an SQL select
     pub(super) fn select_to_plan(
         &self,
+        select: Select,
+        query_order_by: Option<OrderBy>,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        let projection = std::mem::replace(
+            &mut planner_context.identifier_projection,
+            select.projection.clone().into(),
+        );
+        let clause = std::mem::replace(
+            &mut planner_context.identifier_clause,
+            IdentifierClause::From,
+        );
+        let expansions = std::mem::take(&mut planner_context.identifier_expansions);
+        let result = self.select_to_plan_inner(select, query_order_by, planner_context);
+        planner_context.identifier_projection = projection;
+        planner_context.identifier_clause = clause;
+        planner_context.identifier_expansions = expansions;
+        result
+    }
+
+    fn select_to_plan_inner(
+        &self,
         mut select: Select,
         mut query_order_by: Option<OrderBy>,
         planner_context: &mut PlannerContext,
@@ -115,6 +138,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let plan = self.plan_from_tables(select.from, planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
 
+        planner_context.identifier_clause = IdentifierClause::Where;
         // Process `where` clause
         let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
 
@@ -125,6 +149,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         self.match_window_definitions(&mut select.qualify, &select.named_window)?;
         self.match_window_definitions(&mut query_order_by, &select.named_window)?;
 
+        planner_context.identifier_projection = select.projection.clone().into();
         // Process the SELECT expressions
         let select_exprs = self.prepare_select_exprs(
             &base_plan,
@@ -149,6 +174,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Order-by expressions prioritize referencing columns from the select list,
         // then from the FROM clause.
+        planner_context.identifier_clause = IdentifierClause::OrderBy;
         let order_by_rex = self.order_by_to_sort_expr(
             order_by,
             projected_plan.schema().as_ref(),
@@ -178,6 +204,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let mut on_expr_schema = projected_plan.schema().as_ref().clone();
         on_expr_schema.merge(base_plan.schema());
+        planner_context.identifier_clause = IdentifierClause::Other;
         let on_exprs_pre_aggr: Vec<Expr> = on_exprs_sql
             .into_iter()
             .map(|e| {
@@ -197,6 +224,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // volatile alias are deferred to `having_post_projection` and planned
         // above the final projection (see [`references_volatile_alias`]); the
         // remaining conjuncts take the normal path below the projection.
+        planner_context.identifier_clause = IdentifierClause::Having;
         let mut having_post_projection: Option<Expr> = None;
         let having_expr_opt = select
             .having
@@ -263,6 +291,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .flatten();
 
         // All of the group by expressions
+        planner_context.identifier_clause = IdentifierClause::GroupBy;
         let group_by_exprs = if let GroupByExpr::Expressions(exprs, _) = select.group_by {
             exprs
                 .into_iter()
@@ -317,6 +346,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Optionally the QUALIFY expression. Like HAVING, conjuncts that
         // reference a volatile alias are deferred to
         // `qualify_post_projection` and planned above the final projection.
+        planner_context.identifier_clause = IdentifierClause::Qualify;
         let mut qualify_post_projection: Option<Expr> = None;
         let qualify_expr_opt = select
             .qualify
@@ -1115,12 +1145,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut prepared_select_exprs = Vec::with_capacity(projection.len());
         let mut error_builder = DataFusionErrorBuilder::new();
 
-        for expr in projection {
+        let previous_clause = planner_context.identifier_clause;
+        for (index, expr) in projection.into_iter().enumerate() {
+            planner_context.identifier_clause = IdentifierClause::Select { index };
             match self.sql_select_to_rex(expr, plan, empty_from, planner_context) {
                 Ok(expr) => prepared_select_exprs.push(expr),
                 Err(err) => error_builder.add_error(err),
             }
         }
+        planner_context.identifier_clause = previous_clause;
         error_builder.error_or(prepared_select_exprs)
     }
 
