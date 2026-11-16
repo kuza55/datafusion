@@ -102,10 +102,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             IdentifierClause::From,
         );
         let expansions = std::mem::take(&mut planner_context.identifier_expansions);
+        let schema = planner_context.identifier_schema.take();
         let result = self.select_to_plan_inner(select, query_order_by, planner_context);
         planner_context.identifier_projection = projection;
         planner_context.identifier_clause = clause;
         planner_context.identifier_expansions = expansions;
+        planner_context.identifier_schema = schema;
         result
     }
 
@@ -137,6 +139,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Process `from` clause
         let plan = self.plan_from_tables(select.from, planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
+        planner_context.identifier_schema = Some(Arc::clone(plan.schema()));
 
         planner_context.identifier_clause = IdentifierClause::Where;
         // Process `where` clause

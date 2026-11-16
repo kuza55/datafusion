@@ -194,58 +194,38 @@ async fn test_deferred_struct_colon_operator() {
 struct ProjectionAliasPlanner;
 
 impl ExprPlanner for ProjectionAliasPlanner {
-    fn plan_identifier(
+    fn resolve_column(
         &self,
-        identifier: &sqlparser::ast::Ident,
-        schema: &DFSchema,
-        context: &mut dyn datafusion_expr::planner::IdentifierPlannerContext,
-    ) -> Result<Option<Expr>> {
-        use datafusion::sql::sqlparser::ast::SelectItem;
-        use datafusion_expr::planner::IdentifierClause;
-
-        let name = context.normalize_ident(identifier.clone());
-        // Defer source columns, including ambiguous names, to normal resolution.
-        if schema.fields().iter().any(|f| f.name() == &name)
-            || context
-                .outer_query_schemas()
-                .iter()
-                .any(|s| s.fields().iter().any(|f| f.name() == &name))
+        request: &datafusion_expr::planner::ColumnLookup<'_>,
+    ) -> Result<Option<datafusion_expr::planner::BindingId>> {
+        use datafusion_expr::planner::{ColumnBindingKind, IdentifierClause};
+        if request
+            .candidates()
+            .iter()
+            .any(|c| !matches!(c.kind(), ColumnBindingKind::SelectAlias { .. }))
         {
             return Ok(None);
         }
-        let count = match context.clause() {
-            IdentifierClause::Select { index } => index,
-            IdentifierClause::Where | IdentifierClause::From => {
-                context.projection().len()
-            }
-            _ => return Ok(None),
-        };
         let mut aliases =
-            context
-                .projection()
+            request
+                .candidates()
                 .iter()
-                .take(count)
-                .filter_map(|item| match item {
-                    SelectItem::ExprWithAlias { expr, alias }
-                        if context.normalize_ident(alias.clone()) == name =>
-                    {
-                        Some(expr.clone())
-                    }
-                    _ => None,
+                .filter(|c| match (c.kind(), request.clause()) {
+                    (
+                        ColumnBindingKind::SelectAlias { index },
+                        IdentifierClause::Select { index: current },
+                    ) => index < current,
+                    (
+                        ColumnBindingKind::SelectAlias { .. },
+                        IdentifierClause::Where | IdentifierClause::From,
+                    ) => true,
+                    _ => false,
                 });
-        let Some(expr) = aliases.next() else {
-            return Ok(None);
-        };
+        let result = aliases.next().map(|c| c.id());
         if aliases.next().is_some() {
-            return datafusion_common::plan_err!("Ambiguous projection alias: {name}");
+            return datafusion_common::plan_err!("Ambiguous projection alias");
         }
-        let expr = context.sql_to_expr(expr)?;
-        if expr.is_volatile() {
-            return datafusion_common::plan_err!(
-                "Volatile alias requires materialization: {name}"
-            );
-        }
-        Ok(Some(expr))
+        Ok(result)
     }
 }
 
@@ -255,6 +235,10 @@ async fn identifier_planner_binds_query_local_aliases() -> Result<()> {
     ctx.register_expr_planner(Arc::new(ProjectionAliasPlanner))?;
     for (sql, expected) in [
         ("SELECT 1 AS a, a + 1 AS b, b + 1 AS c", vec![vec![1, 2, 3]]),
+        (
+            "SELECT SUM(x) AS a, a + 1 AS b FROM (VALUES (1), (2)) t(x)",
+            vec![vec![3, 4]],
+        ),
         ("SELECT 1 AS a, [a][1] AS b", vec![vec![1, 1]]),
         (
             "SELECT x + 1 AS a FROM (VALUES (1), (2)) t(x) WHERE a > 2",
@@ -322,14 +306,7 @@ async fn identifier_planner_preserves_errors_and_scope() -> Result<()> {
         ("SELECT a AS b, 1 AS a", "No field named a"),
         ("SELECT 1 AS a, (SELECT a) AS b", "No field named a"),
         ("SELECT 1 AS \"A\", a AS b", "No field named a"),
-        (
-            "SELECT b AS a, a AS b WHERE a > 0",
-            "Cyclic identifier expansion",
-        ),
-        (
-            "SELECT random() AS r, r + 1 AS s",
-            "Volatile alias requires materialization",
-        ),
+        ("SELECT b AS a, a AS b WHERE a > 0", "No field named b"),
         (
             "SELECT 1 AS z, z FROM (VALUES (2)) a(z) CROSS JOIN (VALUES (3)) b(z)",
             "Ambiguous reference",
@@ -349,5 +326,83 @@ async fn identifier_planner_preserves_errors_and_scope() -> Result<()> {
     );
     let stock = SessionContext::new();
     assert!(stock.sql("SELECT 1 AS a, a + 1 AS b").await.is_err());
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StaleColumnBinding(std::sync::Mutex<Option<datafusion_expr::planner::BindingId>>);
+
+impl ExprPlanner for StaleColumnBinding {
+    fn resolve_column(
+        &self,
+        request: &datafusion_expr::planner::ColumnLookup<'_>,
+    ) -> Result<Option<datafusion_expr::planner::BindingId>> {
+        let mut previous = self.0.lock().unwrap();
+        if previous.is_some() {
+            return Ok(*previous);
+        }
+        *previous = request.candidates().first().map(|binding| binding.id());
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn column_bindings_reject_ids_from_another_lookup() -> Result<()> {
+    let mut ctx = SessionContext::new();
+    ctx.register_expr_planner(Arc::new(StaleColumnBinding::default()))?;
+    let error = ctx
+        .sql("SELECT t.x, t.y FROM (VALUES (1, 2)) t(x, y)")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not belong to this lookup"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FirstColumnBinding;
+
+impl ExprPlanner for FirstColumnBinding {
+    fn resolve_column(
+        &self,
+        request: &datafusion_expr::planner::ColumnLookup<'_>,
+    ) -> Result<Option<datafusion_expr::planner::BindingId>> {
+        Ok(request.candidates().first().map(|binding| binding.id()))
+    }
+}
+
+#[tokio::test]
+async fn column_bindings_select_qualified_names_and_reject_alias_cycles() -> Result<()> {
+    let mut ctx = SessionContext::new();
+    ctx.register_expr_planner(Arc::new(FirstColumnBinding))?;
+    let batches = ctx
+        .sql("SELECT b.k FROM (VALUES (1)) a(k) CROSS JOIN (VALUES (2)) b(k)")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)?,
+        ScalarValue::Int64(Some(2))
+    );
+    let error = ctx.sql("SELECT b AS a, a AS b").await.unwrap_err();
+    assert!(
+        error.to_string().contains("Cyclic identifier expansion"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn alias_binding_allows_volatile_expressions() -> Result<()> {
+    let mut ctx = SessionContext::new();
+    ctx.register_expr_planner(Arc::new(ProjectionAliasPlanner))?;
+    let batches = ctx
+        .sql("SELECT random() AS r, r AS s")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!((batches[0].num_rows(), batches[0].num_columns()), (1, 2));
     Ok(())
 }

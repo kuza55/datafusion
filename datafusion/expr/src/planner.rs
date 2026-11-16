@@ -21,9 +21,7 @@ use datafusion_common::{
     file_options::file_type::FileType, not_impl_err,
 };
 #[cfg(feature = "sql")]
-use sqlparser::ast::{
-    Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor,
-};
+use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor};
 
 /// Provides the `SQL` query planner meta-data about tables and
 /// functions referenced in SQL statements, without a direct dependency on the
@@ -143,18 +141,12 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
-    /// Plan a bare identifier after lambda/variable lookup and before column lookup.
+    /// Select an engine-owned column or alias definition. `None` preserves lookup.
     ///
-    /// Return `None` to preserve normal resolution. Implementations own precedence
-    /// and ambiguity policy; use `schema` and the outer schemas before substituting
-    /// aliases. Qualified identifiers use the existing compound-identifier path.
+    /// The returned ID must belong to this request. Both bare and qualified
+    /// columns are supported; nested field access retains its existing planner.
     #[cfg(feature = "sql")]
-    fn plan_identifier(
-        &self,
-        _identifier: &Ident,
-        _schema: &DFSchema,
-        _context: &mut dyn IdentifierPlannerContext,
-    ) -> Result<Option<Expr>> {
+    fn resolve_column(&self, _request: &ColumnLookup<'_>) -> Result<Option<BindingId>> {
         Ok(None)
     }
 
@@ -340,26 +332,109 @@ pub enum IdentifierClause {
     Other,
 }
 
-/// Query-local context for [`ExprPlanner::plan_identifier`].
-///
-/// This interface exposes binding inputs, not an alias materialization mechanism.
-/// Substituting volatile expressions can change evaluation counts; extensions
-/// must materialize them elsewhere or reject such substitutions.
+/// Opaque identity of an engine-supplied binding, valid only in its request.
 #[cfg(feature = "sql")]
-pub trait IdentifierPlannerContext {
-    /// Projection of the current SELECT, without projections from outer queries.
-    fn projection(&self) -> &[SelectItem];
-    /// Clause in which the identifier occurs.
-    fn clause(&self) -> IdentifierClause;
-    /// Outer query schemas, ordered from outermost to innermost.
-    fn outer_query_schemas(&self) -> &[datafusion_common::DFSchemaRef];
-    /// Normalize an identifier using the current parser options.
-    fn normalize_ident(&self, identifier: Ident) -> String;
-    /// Plan a replacement in the current expression's schema and scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingId(u64);
+
+/// Origin of a candidate SQL binding.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnBindingKind {
+    /// A column in the current input.
+    Input,
+    /// An explicitly named SELECT expression, before wildcard expansion.
+    SelectAlias { index: usize },
+    /// A correlated column; depth zero is the nearest outer query.
+    Outer { depth: usize },
+}
+
+/// Read-only metadata for a binding the engine can resolve.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnBinding {
+    id: BindingId,
+    column: datafusion_common::Column,
+    kind: ColumnBindingKind,
+}
+
+#[cfg(feature = "sql")]
+impl ColumnBinding {
+    /// Identity to return from a binding hook.
+    pub fn id(&self) -> BindingId {
+        self.id
+    }
+    /// Normalized name and optional relation qualifier.
+    pub fn column(&self) -> &datafusion_common::Column {
+        &self.column
+    }
+    /// Definition origin and position.
+    pub fn kind(&self) -> ColumnBindingKind {
+        self.kind
+    }
+
+    /// Construct engine-owned binding metadata.
     ///
-    /// Re-entering this method for the same identifier in the same SELECT
-    /// produces a cycle error. Subqueries receive independent binding scopes.
-    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr>;
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(column: datafusion_common::Column, kind: ColumnBindingKind) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: BindingId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            column,
+            kind,
+        }
+    }
+}
+
+/// A name lookup with engine-owned candidates. Selecting an alias binds its
+/// definition in its SELECT scope; it does not guarantee single evaluation.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnLookup<'a> {
+    identifiers: &'a [Ident],
+    clause: IdentifierClause,
+    candidates: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> ColumnLookup<'a> {
+    /// Original identifier parts, including quoting and source spans.
+    pub fn identifiers(&self) -> &[Ident] {
+        self.identifiers
+    }
+    /// Clause containing this reference.
+    pub fn clause(&self) -> IdentifierClause {
+        self.clause
+    }
+    /// Matching definitions; the extension chooses precedence and ambiguity policy.
+    pub fn candidates(&self) -> &[ColumnBinding] {
+        self.candidates
+    }
+
+    /// Construct a lookup for SQL planner dispatch.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        identifiers: &'a [Ident],
+        clause: IdentifierClause,
+        candidates: &'a [ColumnBinding],
+    ) -> Self {
+        Self {
+            identifiers,
+            clause,
+            candidates,
+        }
+    }
 }
 
 /// An operator with two arguments to plan
