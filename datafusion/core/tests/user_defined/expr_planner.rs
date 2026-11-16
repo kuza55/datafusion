@@ -207,7 +207,9 @@ impl ExprPlanner for NumericLiteralPlanner {
             "1e2" if !literal.negative => ScalarValue::Int32(Some(100)),
             "7" if literal.long && !literal.negative => ScalarValue::Int32(Some(7)),
             "1_000" if !literal.negative => ScalarValue::Int32(Some(1000)),
-            "999" => return datafusion_common::plan_err!("literal rejected by extension"),
+            "999" => {
+                return datafusion_common::plan_err!("literal rejected by extension");
+            }
             _ => return Ok(PlannerResult::Original(literal)),
         };
         Ok(PlannerResult::Planned(datafusion_expr::lit(value)))
@@ -236,7 +238,11 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
     let mut ctx = SessionContext::new_with_config(config);
     ctx.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
     ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
-    let batches = ctx.sql("SELECT 1.2300, -1.2300, 1e2, 7L, 1_000, -9223372036854775808 AS min_int").await?.collect().await?;
+    let batches = ctx
+        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, 1_000, -9223372036854775808 AS min_int")
+        .await?
+        .collect()
+        .await?;
     let expected = [
         ScalarValue::Decimal128(Some(12300), 10, 4),
         ScalarValue::Decimal128(Some(-12300), 10, 4),
@@ -249,10 +255,14 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
         assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
     }
     assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "1.2300".into(), negative: true, long: false,
+        value: "1.2300".into(),
+        negative: true,
+        long: false,
     }));
     assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "7".into(), negative: false, long: true,
+        value: "7".into(),
+        negative: false,
+        long: true,
     }));
     let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
     assert!(error.contains("literal rejected by extension"), "{error}");
