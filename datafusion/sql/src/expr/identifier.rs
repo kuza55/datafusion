@@ -44,7 +44,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let mut candidates = vec![];
         let mut expressions = vec![];
-        if let Some(input) = &planner_context.identifier_input {
+        if let Some(input) = &planner_context.identifier_input
+            && matches!(
+                input.as_ref(),
+                datafusion_expr::LogicalPlan::Join(_)
+                    | datafusion_expr::LogicalPlan::Filter(_)
+            )
+        {
             for binding in crate::relation::join::column_bindings(input, planner_context)?
             {
                 if matches(&binding.column)
@@ -60,7 +66,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
             }
         }
-        for (q, field) in schema.iter() {
+        for (q, field) in schema.qualified_fields_with_unqualified_name(name) {
             let column = Column::from((q, field));
             if matches(&column)
                 && !candidates.iter().any(|binding| {
@@ -118,7 +124,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     expressions.push(Some(expr));
                 }
             }
-            for (q, field) in outer.iter() {
+            for (q, field) in outer.qualified_fields_with_unqualified_name(name) {
                 let column = Column::from((q, field));
                 if matches(&column) {
                     candidates.push(ColumnBinding::new(

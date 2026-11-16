@@ -399,12 +399,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             JoinConstraint::Natural => {
                 let left_cols: HashSet<&String> =
                     left.schema().fields().iter().map(|f| f.name()).collect();
+                let mut seen = HashSet::new();
                 let keys: Vec<Column> = right
                     .schema()
                     .fields()
                     .iter()
                     .map(|f| f.name())
-                    .filter(|f| left_cols.contains(f))
+                    .filter(|f| left_cols.contains(f) && seen.insert(*f))
                     .map(Column::from_name)
                     .collect();
                 if keys.is_empty() {

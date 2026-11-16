@@ -852,6 +852,10 @@ async fn joined_bindings_preserve_keys_scopes_and_modifiers() -> Result<()> {
                 vec![vec![Some(2)]],
             ),
             (
+                "SELECT k FROM ((VALUES (1)) a(k) FULL JOIN (VALUES (2)) b(k) USING(k)) NATURAL JOIN ((VALUES (2)) c(k) FULL JOIN (VALUES (3)) d(k) USING(k))",
+                vec![vec![Some(2)]],
+            ),
+            (
                 "SELECT k FROM (VALUES (1)) a(k) NATURAL FULL JOIN (VALUES (2)) b(k) WHERE k > 1",
                 vec![vec![Some(2)]],
             ),
