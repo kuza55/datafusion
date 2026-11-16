@@ -196,7 +196,7 @@ problem until the preceding prototype establishes a sound representation.
 4. Implement alias dependency resolution and value placement over those identities.
    Demonstrate scalar, aggregate and window reuse, rejection of illegal uses, and
    optimizer/physical-plan preservation before exposing a placement API.
-5. Wire the real df2rs adapter through normal SessionContext construction and a
+5. Wire a real downstream adapter through normal SessionContext construction and a
    custom SessionState. Add an independent consumer using Spark lateral-alias/CTE
    requirements or PostgreSQL join/alias rules. Neither counts as full dialect
    compatibility; compare explicitly documented/recorded cases.
