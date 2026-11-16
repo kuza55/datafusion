@@ -199,7 +199,7 @@ impl ExprPlanner for ProjectionAliasPlanner {
         identifier: &datafusion::sql::sqlparser::ast::Ident,
         schema: &DFSchema,
         context: &mut dyn datafusion_expr::planner::IdentifierPlannerContext,
-    ) -> Result<Option<datafusion_expr::Expr>> {
+    ) -> Result<Option<Expr>> {
         use datafusion::sql::sqlparser::ast::SelectItem;
         use datafusion_expr::planner::IdentifierClause;
 
