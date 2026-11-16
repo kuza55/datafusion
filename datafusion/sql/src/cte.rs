@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
@@ -11,6 +12,7 @@ use datafusion_common::{
     Result, TableReference, not_impl_err, plan_err,
     tree_node::{TreeNode, TreeNodeRecursion},
 };
+use datafusion_expr::planner::CteConflictResolution;
 use datafusion_expr::{
     LogicalPlan, LogicalPlanBuilder, MaterializedCte, MaterializedCteId,
     MaterializedCtePlan, MaterializedCteScan, TableSource,
@@ -46,22 +48,39 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<Vec<PendingMaterializedCte>> {
         let is_recursive = with.recursive;
         let mut materialized = vec![];
+        let mut local_names = HashSet::new();
         // Process CTEs from top to bottom
         for cte in with.cte_tables {
-            // A `WITH` block can't use the same name more than once
             let cte_name = self.ident_normalizer.normalize(cte.alias.name.clone());
-            if planner_context.contains_cte(&cte_name) {
+            if !local_names.insert(cte_name.clone()) {
                 return plan_err!(
                     "WITH query name {cte_name:?} specified more than once"
                 );
             }
-
-            // Create a logical plan for the CTE
+            let mut resolution = None;
+            if planner_context.contains_cte(&cte_name) {
+                for planner in self.context_provider.get_relation_planners() {
+                    resolution = planner.resolve_cte_conflict(&cte_name)?;
+                    if resolution.is_some() {
+                        break;
+                    }
+                }
+                if resolution.is_none() {
+                    return plan_err!(
+                        "WITH query name {cte_name:?} specified more than once"
+                    );
+                }
+            }
+            let keep_outer = resolution == Some(CteConflictResolution::KeepOuter);
+            // Recursive planning temporarily installs a work table. An ignored
+            // definition must not replace the inherited binding with that table.
+            let mut ignored_context = keep_outer.then(|| planner_context.clone());
+            let body_context = ignored_context.as_mut().unwrap_or(planner_context);
             let cte_plan = if is_recursive {
                 let columns = cte.alias.columns.iter().map(|c| c.name.clone()).collect();
-                self.recursive_cte(&cte_name, columns, *cte.query, planner_context)?
+                self.recursive_cte(&cte_name, columns, *cte.query, body_context)?
             } else {
-                self.non_recursive_cte(*cte.query, planner_context)?
+                self.non_recursive_cte(*cte.query, body_context)?
             };
 
             // Each `WITH` block can change the column names in the last projection
@@ -82,6 +101,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             } else {
                 self.apply_table_alias(cte_plan, cte.alias)?
             };
+            if keep_outer {
+                continue;
+            }
             if is_materialized {
                 // Every reference reads the shared result instead of a copy
                 // of the body. The body is already planned, so a reference
