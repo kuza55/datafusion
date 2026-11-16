@@ -353,7 +353,7 @@ async fn identifier_planner_preserves_errors_and_scope() -> Result<()> {
 }
 
 #[derive(Debug)]
-struct MaterializeFirst(datafusion_expr::planner::SelectInputStage);
+pub(super) struct MaterializeFirst(pub(super) datafusion_expr::planner::SelectInputStage);
 
 impl datafusion_expr::planner::RelationPlanner for MaterializeFirst {
     fn plan_relation(
@@ -430,28 +430,15 @@ async fn select_input_materialization_execution() -> Result<()> {
         );
         let batches = ctx.sql(&sql).await?.collect().await?;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert_eq!(batches[0].num_columns(), 4);
-        for batch in batches {
-            let a = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let b = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let c = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            for row in 0..batch.num_rows() {
-                assert_eq!(a.value(row), b.value(row));
-                assert_eq!(a.value(row) + 1, c.value(row));
-            }
-        }
+        insta::assert_snapshot!(batches_to_string(&batches), @r"
+        +---+---+---+---+
+        | a | b | c | i |
+        +---+---+---+---+
+        | 1 | 1 | 2 | 1 |
+        | 2 | 2 | 3 | 2 |
+        | 3 | 3 | 4 | 3 |
+        +---+---+---+---+
+        ");
         for sql in [
             "SELECT sum(i) AS a FROM (VALUES (1)) t(i)",
             "SELECT row_number() OVER () AS a FROM (VALUES (1)) t(i)",

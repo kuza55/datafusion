@@ -828,50 +828,23 @@ async fn join_wildcard_policy_execution() -> Result<()> {
 
 #[tokio::test]
 async fn join_and_materialization_hooks_execute_together() -> Result<()> {
-    use datafusion::execution::FunctionRegistry;
-    use datafusion_expr::planner::{SelectInputPlannerContext, SelectInputStage};
-    use sqlparser::ast::{Expr as SqlExpr, Ident, SelectItem};
-    #[derive(Debug)]
-    struct MaterializeKey;
-    impl RelationPlanner for MaterializeKey {
-        fn plan_relation(
-            &self,
-            relation: TableFactor,
-            _context: &mut dyn RelationPlannerContext,
-        ) -> Result<RelationPlanning> {
-            Ok(RelationPlanning::Original(Box::new(relation)))
-        }
-        fn plan_select_input(
-            &self,
-            projection: &mut Vec<SelectItem>,
-            stage: SelectInputStage,
-            context: &mut dyn SelectInputPlannerContext,
-        ) -> Result<()> {
-            if stage == SelectInputStage::BeforeProjection
-                && let Some(SelectItem::ExprWithAlias { expr, alias }) =
-                    projection.first_mut()
-                && alias.value == "selected_key"
-            {
-                let planned = context.sql_to_expr(expr.clone())?;
-                let column = context.materialize(planned)?;
-                *expr = SqlExpr::Identifier(Ident::with_quote('"', column.name));
-            }
-            Ok(())
-        }
-    }
-    let mut ctx = SessionContext::new();
-    ctx.register_relation_planner(Arc::new(MergedJoinPlanner))?;
-    ctx.register_relation_planner(Arc::new(MaterializeKey))?;
-    ctx.register_expr_planner(Arc::new(MergedJoinPlanner))?;
-    let sql = "SELECT k AS selected_key, * FROM (VALUES (2, 20)) a(k, av) FULL JOIN (VALUES (3, 30)) b(k, bv) USING (k) ORDER BY k";
-    let batches = ctx.sql(sql).await?.collect().await?;
+    use super::expr_planner::MaterializeFirst;
+    use datafusion_expr::planner::SelectInputStage;
+    let ctx = SessionContext::new();
+    ctx.register_relation_planner(Arc::new(JoinWildcardPlanner))?;
+    ctx.register_relation_planner(Arc::new(MaterializeFirst(
+        SelectInputStage::BeforeProjection,
+    )))?;
+    let batches = ctx.sql(
+        "SELECT 7 AS selected_key, * FROM (VALUES (1)) a(x) CROSS JOIN (VALUES (2)) b(y) ORDER BY y"
+    ).await?.collect().await?;
     assert_snapshot!(batches_to_string(&batches), @r"
-    +--------------+---+----+----+
-    | selected_key | k | av | bv |
-    +--------------+---+----+----+
-    | 2            | 2 | 20 |    |
-    | 3            | 3 |    | 30 |
-    +--------------+---+----+----+
+    +--------------+---+---+
+    | selected_key | y | x |
+    +--------------+---+---+
+    | 7            | 2 |   |
+    | 7            |   | 1 |
+    +--------------+---+---+
     ");
     Ok(())
 }

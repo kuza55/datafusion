@@ -176,15 +176,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     fn plan_select_input_extensions(
         &self,
         input: LogicalPlan,
-        select: &mut Select,
+        projection: &mut Vec<SelectItem>,
         stage: SelectInputStage,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         if self.context_provider.get_relation_planners().is_empty() {
             return Ok(input);
         }
-        let reserved_names = select
-            .projection
+        let reserved_names = projection
             .iter()
             .filter_map(|item| match item {
                 SelectItem::ExprWithAlias { alias, .. } => {
@@ -200,9 +199,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             reserved_names,
         };
         for planner in self.context_provider.get_relation_planners() {
-            planner.plan_select_input(&mut select.projection, stage, &mut context)?;
-            context.planner_context.identifier_projection =
-                select.projection.clone().into();
+            planner.plan_select_input(projection, stage, &mut context)?;
+            context.planner_context.identifier_projection = projection.clone().into();
         }
         Ok(context.input)
     }
@@ -233,23 +231,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let set_expr_left_schema = planner_context.set_set_expr_left_schema(None);
 
         // Process `from` clause
-        let plan =
-            self.plan_from_tables(std::mem::take(&mut select.from), planner_context)?;
+        let plan = self.plan_from_tables(select.from, planner_context)?;
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
 
         let plan = self.plan_select_input_extensions(
             plan,
-            &mut select,
+            &mut select.projection,
             SelectInputStage::BeforeWhere,
             planner_context,
         )?;
         planner_context.identifier_clause = IdentifierClause::Where;
         // Process `where` clause
-        let base_plan =
-            self.plan_selection(select.selection.take(), plan, planner_context)?;
+        let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
         let base_plan = self.plan_select_input_extensions(
             base_plan,
-            &mut select,
+            &mut select.projection,
             SelectInputStage::BeforeProjection,
             planner_context,
         )?;
