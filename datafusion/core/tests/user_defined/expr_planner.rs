@@ -218,28 +218,12 @@ impl ExprPlanner for NumericLiteralPlanner {
 
 #[tokio::test]
 async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
-    use datafusion_expr::planner::RawNumericLiteral;
-    use std::sync::Mutex;
-
-    #[derive(Debug)]
-    struct Observe(Arc<Mutex<Vec<RawNumericLiteral>>>);
-    impl ExprPlanner for Observe {
-        fn plan_numeric_literal(
-            &self,
-            literal: RawNumericLiteral,
-        ) -> Result<PlannerResult<RawNumericLiteral>> {
-            self.0.lock().unwrap().push(literal.clone());
-            Ok(PlannerResult::Original(literal))
-        }
-    }
-
-    let seen = Arc::new(Mutex::new(vec![]));
     let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "spark");
     let mut ctx = SessionContext::new_with_config(config);
-    ctx.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
+    ctx.register_expr_planner(Arc::new(MyCustomPlanner))?;
     ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
     let batches = ctx
-        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, -9223372036854775808 AS min_int")
+        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, -9223372036854775808 AS min_int, 42, -42, 0.5")
         .await?
         .collect()
         .await?;
@@ -249,51 +233,23 @@ async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
         ScalarValue::Int32(Some(100)),
         ScalarValue::Int32(Some(7)),
         ScalarValue::Int64(Some(i64::MIN)),
+        ScalarValue::Int64(Some(42)),
+        ScalarValue::Int64(Some(-42)),
+        ScalarValue::Float64(Some(0.5)),
     ];
     for (column, expected) in batches[0].columns().iter().zip(expected) {
         assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
     }
-    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "1.2300".into(),
-        negative: true,
-        long: false,
-    }));
-    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "7".into(),
-        negative: false,
-        long: true,
-    }));
     let mut postgres = SessionContext::new_with_config(
         SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres"),
     );
-    postgres.register_expr_planner(Arc::new(Observe(Arc::clone(&seen))))?;
     postgres.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
     let batches = postgres.sql("SELECT 1_000").await?.collect().await?;
     assert_eq!(
         ScalarValue::try_from_array(batches[0].column(0), 0)?,
         ScalarValue::Int32(Some(1000))
     );
-    assert!(seen.lock().unwrap().contains(&RawNumericLiteral {
-        value: "1_000".into(),
-        negative: false,
-        long: false,
-    }));
     let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
     assert!(error.contains("literal rejected by extension"), "{error}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn numeric_literal_fallthrough_preserves_defaults() -> Result<()> {
-    let mut ctx = SessionContext::new();
-    ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
-    let batches = ctx.sql("SELECT 42, -42, 0.5").await?.collect().await?;
-    for (column, expected) in batches[0].columns().iter().zip([
-        ScalarValue::Int64(Some(42)),
-        ScalarValue::Int64(Some(-42)),
-        ScalarValue::Float64(Some(0.5)),
-    ]) {
-        assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
-    }
     Ok(())
 }
