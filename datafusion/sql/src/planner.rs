@@ -570,22 +570,36 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         idents: Vec<Ident>,
     ) -> Result<LogicalPlan> {
         if idents.is_empty() {
-            Ok(plan)
-        } else if idents.len() != plan.schema().fields().len() {
-            plan_err!(
-                "Source table contains {} columns but only {} \
-                names given as column alias",
-                plan.schema().fields().len(),
-                idents.len()
-            )
-        } else {
-            let columns = plan.schema().columns();
-            LogicalPlanBuilder::from(plan)
-                .project(columns.into_iter().zip(idents).map(|(col, ident)| {
-                    Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
-                }))?
-                .build()
+            return Ok(plan);
         }
+        let mut names: Vec<_> = idents
+            .into_iter()
+            .map(|ident| self.ident_normalizer.normalize(ident))
+            .collect();
+        for planner in self.context_provider.get_relation_planners() {
+            if let Some(replacement) =
+                planner.plan_column_aliases(&names, plan.schema())?
+            {
+                names = replacement;
+                break;
+            }
+        }
+        if names.len() != plan.schema().fields().len() {
+            return plan_err!(
+                "Source table contains {} columns but only {} names given as column alias",
+                plan.schema().fields().len(),
+                names.len()
+            );
+        }
+        let columns = plan.schema().columns();
+        LogicalPlanBuilder::from(plan)
+            .project(
+                columns
+                    .into_iter()
+                    .zip(names)
+                    .map(|(col, name)| Expr::Column(col).alias(name)),
+            )?
+            .build()
     }
 
     /// Validate the schema provides all of the columns referenced in the expressions.
