@@ -44,7 +44,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let mut candidates = vec![];
         let mut expressions = vec![];
-        for (q, field) in schema.iter() {
+        for (q, field) in schema.qualified_fields_with_unqualified_name(name) {
             let column = Column::from((q, field));
             if matches(&column) {
                 candidates
@@ -67,7 +67,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         }
         for (depth, outer) in planner_context.outer_schemas_iter().enumerate() {
-            for (q, field) in outer.iter() {
+            for (q, field) in outer.qualified_fields_with_unqualified_name(name) {
                 let column = Column::from((q, field));
                 if matches(&column) {
                     candidates.push(ColumnBinding::new(
