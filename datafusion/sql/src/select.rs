@@ -27,13 +27,13 @@ use datafusion_common::{
 };
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
-use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::Unnest as UnnestExpr;
 use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
     normalize_col, normalize_col_with_schemas_and_ambiguity_check, normalize_sorts,
 };
+use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::utils::{
     conjunction, expr_as_column_expr, expr_to_columns, find_aggregate_exprs,
@@ -149,7 +149,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         self.match_window_definitions(&mut select.qualify, &select.named_window)?;
         self.match_window_definitions(&mut query_order_by, &select.named_window)?;
 
-        planner_context.identifier_projection = select.projection.clone().into();
+        if !select.named_window.is_empty() {
+            planner_context.identifier_projection = select.projection.clone().into();
+        }
         // Process the SELECT expressions
         let select_exprs = self.prepare_select_exprs(
             &base_plan,

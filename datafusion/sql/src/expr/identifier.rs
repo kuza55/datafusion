@@ -9,7 +9,9 @@ use datafusion_common::{
     exec_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr::expr::LambdaVariable;
-use datafusion_expr::planner::{IdentifierClause, IdentifierPlannerContext, PlannerResult};
+use datafusion_expr::planner::{
+    IdentifierClause, IdentifierPlannerContext, PlannerResult,
+};
 use datafusion_expr::{Case, Expr};
 use sqlparser::ast::{CaseWhen, Expr as SQLExpr, Ident, SelectItem};
 use std::sync::Arc;
@@ -42,11 +44,20 @@ impl<S: ContextProvider> IdentifierPlannerContext for IdentifierContext<'_, '_, 
     }
 
     fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr> {
-        if self.planner_context.identifier_expansions.iter().any(|name| name == self.name) {
+        if self
+            .planner_context
+            .identifier_expansions
+            .iter()
+            .any(|name| name == self.name)
+        {
             return plan_err!("Cyclic identifier expansion: {}", self.name);
         }
-        self.planner_context.identifier_expansions.push(self.name.to_owned());
-        let result = self.planner.sql_to_expr(expr, self.schema, self.planner_context);
+        self.planner_context
+            .identifier_expansions
+            .push(self.name.to_owned());
+        let result = self
+            .planner
+            .sql_to_expr(expr, self.schema, self.planner_context);
         self.planner_context.identifier_expansions.pop();
         result
     }

@@ -21,13 +21,15 @@ use datafusion_common::{
     plan_datafusion_err,
 };
 use datafusion_expr::Expr;
-use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
+use datafusion_expr::planner::IdentifierClause;
 use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
-use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, SelectItem, TableAlias};
+use sqlparser::ast::{
+    DataType as SQLDataType, Ident, ObjectName, SelectItem, TableAlias,
+};
 
 /// SQL parser options
 #[derive(Debug, Clone, Copy)]

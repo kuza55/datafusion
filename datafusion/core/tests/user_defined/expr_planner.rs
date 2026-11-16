@@ -206,31 +206,44 @@ impl ExprPlanner for ProjectionAliasPlanner {
         let name = context.normalize_ident(identifier.clone());
         // Defer source columns, including ambiguous names, to normal resolution.
         if schema.fields().iter().any(|f| f.name() == &name)
-            || context.outer_query_schemas().iter().any(|s| {
-                s.fields().iter().any(|f| f.name() == &name)
-            })
+            || context
+                .outer_query_schemas()
+                .iter()
+                .any(|s| s.fields().iter().any(|f| f.name() == &name))
         {
             return Ok(None);
         }
         let count = match context.clause() {
             IdentifierClause::Select { index } => index,
-            IdentifierClause::Where | IdentifierClause::From => context.projection().len(),
+            IdentifierClause::Where | IdentifierClause::From => {
+                context.projection().len()
+            }
             _ => return Ok(None),
         };
-        let mut aliases = context.projection().iter().take(count).filter_map(|item| {
-            match item {
-                SelectItem::ExprWithAlias { expr, alias }
-                    if context.normalize_ident(alias.clone()) == name => Some(expr.clone()),
-                _ => None,
-            }
-        });
-        let Some(expr) = aliases.next() else { return Ok(None); };
+        let mut aliases =
+            context
+                .projection()
+                .iter()
+                .take(count)
+                .filter_map(|item| match item {
+                    SelectItem::ExprWithAlias { expr, alias }
+                        if context.normalize_ident(alias.clone()) == name =>
+                    {
+                        Some(expr.clone())
+                    }
+                    _ => None,
+                });
+        let Some(expr) = aliases.next() else {
+            return Ok(None);
+        };
         if aliases.next().is_some() {
             return datafusion_common::plan_err!("Ambiguous projection alias: {name}");
         }
         let expr = context.sql_to_expr(expr)?;
         if expr.is_volatile() {
-            return datafusion_common::plan_err!("Volatile alias requires materialization: {name}");
+            return datafusion_common::plan_err!(
+                "Volatile alias requires materialization: {name}"
+            );
         }
         Ok(Some(expr))
     }
@@ -242,26 +255,53 @@ async fn identifier_planner_binds_query_local_aliases() -> Result<()> {
     ctx.register_expr_planner(Arc::new(ProjectionAliasPlanner))?;
     for (sql, expected) in [
         ("SELECT 1 AS a, a + 1 AS b, b + 1 AS c", vec![vec![1, 2, 3]]),
-        ("SELECT x + 1 AS a FROM (VALUES (1), (2)) t(x) WHERE a > 2", vec![vec![3]]),
-        ("SELECT a.x + b.y AS z FROM (VALUES (1)) a(x) JOIN (VALUES (2)) b(y) ON z = 3", vec![vec![3]]),
-        ("SELECT x + 1 AS a, SUM(a) OVER () AS s FROM (VALUES (1), (2)) t(x) ORDER BY a", vec![vec![2, 5], vec![3, 5]]),
-        ("SELECT x + 1 AS x, x AS y FROM (VALUES (4)) t(x)", vec![vec![5, 4]]),
+        (
+            "SELECT x + 1 AS a FROM (VALUES (1), (2)) t(x) WHERE a > 2",
+            vec![vec![3]],
+        ),
+        (
+            "SELECT a.x + b.y AS z FROM (VALUES (1)) a(x) JOIN (VALUES (2)) b(y) ON z = 3",
+            vec![vec![3]],
+        ),
+        (
+            "SELECT x + 1 AS a, SUM(a) OVER () AS s FROM (VALUES (1), (2)) t(x) ORDER BY a",
+            vec![vec![2, 5], vec![3, 5]],
+        ),
+        (
+            "SELECT x + 1 AS x, x AS y FROM (VALUES (4)) t(x)",
+            vec![vec![5, 4]],
+        ),
         ("SELECT 7 AS \"A\", \"A\" + 1 AS b", vec![vec![7, 8]]),
         ("SELECT b FROM (SELECT 2 AS a, a + 1 AS b) q", vec![vec![3]]),
-        ("SELECT 1 AS a, a + 1 AS b UNION ALL SELECT 3 AS a, a + 1 AS b", vec![vec![1, 2], vec![3, 4]]),
-        ("SELECT x AS a, (SELECT x) AS b FROM (VALUES (4)) t(x)", vec![vec![4, 4]]),
-        ("WITH q AS (SELECT 5 AS a, a + 1 AS b) SELECT b FROM q", vec![vec![6]]),
+        (
+            "SELECT 1 AS a, a + 1 AS b UNION ALL SELECT 3 AS a, a + 1 AS b",
+            vec![vec![1, 2], vec![3, 4]],
+        ),
+        (
+            "SELECT x AS a, (SELECT x) AS b FROM (VALUES (4)) t(x)",
+            vec![vec![4, 4]],
+        ),
+        (
+            "WITH q AS (SELECT 5 AS a, a + 1 AS b) SELECT b FROM q",
+            vec![vec![6]],
+        ),
     ] {
         let batches = ctx.sql(sql).await?.collect().await?;
         let mut actual = vec![];
         for batch in batches {
             for row in 0..batch.num_rows() {
-                actual.push(batch.columns().iter().map(|column| {
-                    match ScalarValue::try_from_array(column, row).unwrap() {
-                        ScalarValue::Int64(Some(value)) => value,
-                        value => panic!("unexpected value {value:?} for {sql}"),
-                    }
-                }).collect::<Vec<_>>());
+                actual.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            match ScalarValue::try_from_array(column, row).unwrap() {
+                                ScalarValue::Int64(Some(value)) => value,
+                                value => panic!("unexpected value {value:?} for {sql}"),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
         }
         assert_eq!(actual, expected, "{sql}");
@@ -277,16 +317,31 @@ async fn identifier_planner_preserves_errors_and_scope() -> Result<()> {
         ("SELECT a AS b, 1 AS a", "No field named a"),
         ("SELECT 1 AS a, (SELECT a) AS b", "No field named a"),
         ("SELECT 1 AS \"A\", a AS b", "No field named a"),
-        ("SELECT b AS a, a AS b WHERE a > 0", "Cyclic identifier expansion"),
-        ("SELECT random() AS r, r + 1 AS s", "Volatile alias requires materialization"),
-        ("SELECT 1 AS z, z FROM (VALUES (2)) a(z) CROSS JOIN (VALUES (3)) b(z)", "Ambiguous reference"),
-        ("SELECT 1 AS a, 2 AS a WHERE a = 1", "Ambiguous projection alias"),
+        (
+            "SELECT b AS a, a AS b WHERE a > 0",
+            "Cyclic identifier expansion",
+        ),
+        (
+            "SELECT random() AS r, r + 1 AS s",
+            "Volatile alias requires materialization",
+        ),
+        (
+            "SELECT 1 AS z, z FROM (VALUES (2)) a(z) CROSS JOIN (VALUES (3)) b(z)",
+            "Ambiguous reference",
+        ),
+        (
+            "SELECT 1 AS a, 2 AS a WHERE a = 1",
+            "Ambiguous projection alias",
+        ),
     ] {
         let error = ctx.sql(sql).await.unwrap_err().to_string();
         assert!(error.contains(message), "{sql}: {error}");
     }
     // An earlier error must not contaminate a later query's scope or cycle guard.
-    assert_eq!(ctx.sql("SELECT 1 AS a, a AS b").await?.collect().await?[0].num_rows(), 1);
+    assert_eq!(
+        ctx.sql("SELECT 1 AS a, a AS b").await?.collect().await?[0].num_rows(),
+        1
+    );
     let stock = SessionContext::new();
     assert!(stock.sql("SELECT 1 AS a, a + 1 AS b").await.is_err());
     Ok(())

@@ -21,7 +21,9 @@ use datafusion_common::{
     file_options::file_type::FileType, not_impl_err,
 };
 #[cfg(feature = "sql")]
-use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor};
+use sqlparser::ast::{
+    Expr as SQLExpr, Ident, ObjectName, SelectItem, TableAlias, TableFactor,
+};
 
 /// Provides the `SQL` query planner meta-data about tables and
 /// functions referenced in SQL statements, without a direct dependency on the
@@ -318,7 +320,10 @@ pub trait ExprPlanner: Debug + Send + Sync {
 #[non_exhaustive]
 pub enum IdentifierClause {
     /// A projection item, indexed before wildcard expansion.
-    Select { index: usize },
+    Select {
+        /// Zero-based position in the unexpanded SELECT list.
+        index: usize,
+    },
     /// FROM relations, join predicates and table-function arguments.
     From,
     /// WHERE predicate.
