@@ -16,7 +16,7 @@ use datafusion_common::{
     not_impl_err, plan_err,
 };
 use datafusion_expr::expr::{BinaryExpr, Placeholder};
-use datafusion_expr::planner::PlannerResult;
+use datafusion_expr::planner::{PlannerResult, RawNumericLiteral};
 use datafusion_expr::{Expr, Operator, lit};
 use log::debug;
 use sqlparser::ast::{
@@ -35,7 +35,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         param_data_types: &[Option<FieldRef>],
     ) -> Result<Expr> {
         match value {
-            Value::Number(n, _) => self.parse_sql_number(&n, false),
+            Value::Number(n, long) => self.parse_sql_number(&n, false, long),
             Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(lit(s)),
             Value::Null => Ok(Expr::Literal(ScalarValue::Null, None)),
             Value::Boolean(n) => Ok(lit(n)),
@@ -57,6 +57,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
     /// Parse number in sql string, convert to Expr::Literal
     pub(super) fn parse_sql_number(
+        &self,
+        unsigned_number: &str,
+        negative: bool,
+        long: bool,
+    ) -> Result<Expr> {
+        let planners = self.context_provider.get_expr_planners();
+        if !planners.is_empty() {
+            let mut literal = RawNumericLiteral {
+                value: unsigned_number.to_owned(),
+                negative,
+                long,
+            };
+            for planner in planners {
+                match planner.plan_numeric_literal(literal)? {
+                    PlannerResult::Planned(expr) => return Ok(expr),
+                    PlannerResult::Original(original) => literal = original,
+                }
+            }
+            return self.parse_sql_number_default(&literal.value, literal.negative);
+        }
+        self.parse_sql_number_default(unsigned_number, negative)
+    }
+
+    fn parse_sql_number_default(
         &self,
         unsigned_number: &str,
         negative: bool,

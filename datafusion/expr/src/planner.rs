@@ -141,6 +141,18 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
+    /// Plan a numeric SQL literal before its text is converted to a scalar value.
+    ///
+    /// Returning [`PlannerResult::Original`] passes the literal to the next
+    /// planner, then to DataFusion's default numeric parser. This also handles
+    /// a unary minus applied directly to a numeric literal.
+    fn plan_numeric_literal(
+        &self,
+        literal: RawNumericLiteral,
+    ) -> Result<PlannerResult<RawNumericLiteral>> {
+        Ok(PlannerResult::Original(literal))
+    }
+
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -292,6 +304,19 @@ pub trait ExprPlanner: Debug + Send + Sync {
     fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
         Ok(PlannerResult::Original(expr))
     }
+}
+
+/// A numeric SQL token before type inference or conversion to [`ScalarValue`].
+///
+/// [`ScalarValue`]: datafusion_common::ScalarValue
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawNumericLiteral {
+    /// Original unsigned token text, including scale, exponent and separators.
+    pub value: String,
+    /// Whether a unary minus is applied directly to the token.
+    pub negative: bool,
+    /// The SQL parser's long-integer suffix flag.
+    pub long: bool,
 }
 
 /// An operator with two arguments to plan
