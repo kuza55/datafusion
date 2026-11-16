@@ -141,6 +141,15 @@ pub trait ContextProvider {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait ExprPlanner: Debug + Send + Sync {
+    /// Select an engine-owned column or alias definition. `None` preserves lookup.
+    ///
+    /// The returned ID must belong to this request. Both bare and qualified
+    /// columns are supported; nested field access retains its existing planner.
+    #[cfg(feature = "sql")]
+    fn resolve_column(&self, _request: &ColumnLookup<'_>) -> Result<Option<BindingId>> {
+        Ok(None)
+    }
+
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -291,6 +300,140 @@ pub trait ExprPlanner: Debug + Send + Sync {
     /// Returns original expression arguments if not possible
     fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
         Ok(PlannerResult::Original(expr))
+    }
+}
+
+/// SQL clause containing the identifier being planned.
+///
+/// Window arguments inherit their containing clause. `From` includes join
+/// predicates and table-function arguments; nested queries have their own scope.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdentifierClause {
+    /// A projection item, indexed before wildcard expansion.
+    Select {
+        /// Zero-based position in the unexpanded SELECT list.
+        index: usize,
+    },
+    /// FROM relations, join predicates and table-function arguments.
+    From,
+    /// WHERE predicate.
+    Where,
+    /// GROUP BY expression.
+    GroupBy,
+    /// HAVING predicate.
+    Having,
+    /// QUALIFY predicate.
+    Qualify,
+    /// ORDER BY expression.
+    OrderBy,
+    /// An expression outside the clauses above.
+    Other,
+}
+
+/// Opaque identity of an engine-supplied binding, valid only in its request.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingId(u64);
+
+/// Origin of a candidate SQL binding.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnBindingKind {
+    /// A column in the current input.
+    Input,
+    /// An explicitly named SELECT expression, before wildcard expansion.
+    SelectAlias { index: usize },
+    /// A correlated column; depth zero is the nearest outer query.
+    Outer { depth: usize },
+}
+
+/// Read-only metadata for a binding the engine can resolve.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnBinding {
+    id: BindingId,
+    column: datafusion_common::Column,
+    kind: ColumnBindingKind,
+}
+
+#[cfg(feature = "sql")]
+impl ColumnBinding {
+    /// Identity to return from a binding hook.
+    pub fn id(&self) -> BindingId {
+        self.id
+    }
+    /// Normalized name and optional relation qualifier.
+    pub fn column(&self) -> &datafusion_common::Column {
+        &self.column
+    }
+    /// Definition origin and position.
+    pub fn kind(&self) -> ColumnBindingKind {
+        self.kind
+    }
+
+    /// Construct engine-owned binding metadata.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(column: datafusion_common::Column, kind: ColumnBindingKind) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: BindingId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            column,
+            kind,
+        }
+    }
+}
+
+/// A name lookup with engine-owned candidates. Selecting an alias binds its
+/// definition in its SELECT scope; it does not guarantee single evaluation.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnLookup<'a> {
+    identifiers: &'a [Ident],
+    clause: IdentifierClause,
+    candidates: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> ColumnLookup<'a> {
+    /// Original identifier parts, including quoting and source spans.
+    pub fn identifiers(&self) -> &[Ident] {
+        self.identifiers
+    }
+    /// Clause containing this reference.
+    pub fn clause(&self) -> IdentifierClause {
+        self.clause
+    }
+    /// Matching definitions; the extension chooses precedence and ambiguity policy.
+    pub fn candidates(&self) -> &[ColumnBinding] {
+        self.candidates
+    }
+
+    /// Construct a lookup for SQL planner dispatch.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        identifiers: &'a [Ident],
+        clause: IdentifierClause,
+        candidates: &'a [ColumnBinding],
+    ) -> Self {
+        Self {
+            identifiers,
+            clause,
+            candidates,
+        }
     }
 }
 

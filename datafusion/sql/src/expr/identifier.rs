@@ -9,15 +9,125 @@ use datafusion_common::{
     exec_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr::expr::LambdaVariable;
-use datafusion_expr::planner::PlannerResult;
+use datafusion_expr::planner::{
+    ColumnBinding, ColumnBindingKind, ColumnLookup, IdentifierClause, PlannerResult,
+};
 use datafusion_expr::{Case, Expr};
-use sqlparser::ast::{CaseWhen, Expr as SQLExpr, Ident};
+use sqlparser::ast::{CaseWhen, Expr as SQLExpr, Ident, SelectItem};
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_expr::UNNAMED_TABLE;
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    pub(crate) fn resolve_column_reference(
+        &self,
+        ids: &[Ident],
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Option<Expr>> {
+        let planners = self.context_provider.get_expr_planners();
+        if planners.is_empty() || ids.len() > 4 {
+            return Ok(None);
+        }
+        let normalized: Vec<_> = ids
+            .iter()
+            .cloned()
+            .map(|id| self.ident_normalizer.normalize(id))
+            .collect();
+        let (qualifier, name) = form_identifier(&normalized)?;
+        let matches = |column: &Column| {
+            column.name == *name
+                && qualifier.as_ref().is_none_or(|q| {
+                    column.relation.as_ref().is_some_and(|r| q.resolved_eq(r))
+                })
+        };
+        let mut candidates = vec![];
+        let mut expressions = vec![];
+        for (q, field) in schema.qualified_fields_with_unqualified_name(name) {
+            let column = Column::from((q, field));
+            if matches(&column) {
+                candidates
+                    .push(ColumnBinding::new(column.clone(), ColumnBindingKind::Input));
+                expressions.push(Some(Expr::Column(column)));
+            }
+        }
+        if ids.len() == 1 {
+            for (index, item) in planner_context.identifier_projection.iter().enumerate()
+            {
+                if let SelectItem::ExprWithAlias { alias, .. } = item
+                    && self.ident_normalizer.normalize(alias.clone()) == *name
+                {
+                    candidates.push(ColumnBinding::new(
+                        Column::from_name(name.clone()),
+                        ColumnBindingKind::SelectAlias { index },
+                    ));
+                    expressions.push(None);
+                }
+            }
+        }
+        for (depth, outer) in planner_context.outer_schemas_iter().enumerate() {
+            for (q, field) in outer.qualified_fields_with_unqualified_name(name) {
+                let column = Column::from((q, field));
+                if matches(&column) {
+                    candidates.push(ColumnBinding::new(
+                        column.clone(),
+                        ColumnBindingKind::Outer { depth },
+                    ));
+                    expressions.push(Some(Expr::OuterReferenceColumn(
+                        Arc::clone(field),
+                        column,
+                    )));
+                }
+            }
+        }
+        let request =
+            ColumnLookup::new(ids, planner_context.identifier_clause, &candidates);
+        for planner in planners {
+            if let Some(id) = planner.resolve_column(&request)? {
+                let index = candidates
+                    .iter()
+                    .position(|candidate| candidate.id() == id)
+                    .ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "Column binding does not belong to this lookup"
+                        )
+                    })?;
+                if let Some(expr) = expressions[index].take() {
+                    return Ok(Some(expr));
+                }
+                let ColumnBindingKind::SelectAlias { index } = candidates[index].kind()
+                else {
+                    unreachable!()
+                };
+                if planner_context.identifier_expansions.contains(&index) {
+                    return plan_err!("Cyclic identifier expansion: {name}");
+                }
+                let SelectItem::ExprWithAlias { expr, .. } =
+                    &planner_context.identifier_projection[index]
+                else {
+                    unreachable!()
+                };
+                let expr = expr.clone();
+                let definition_schema = planner_context.identifier_schema.clone();
+                let clause = std::mem::replace(
+                    &mut planner_context.identifier_clause,
+                    IdentifierClause::Select { index },
+                );
+                planner_context.identifier_expansions.push(index);
+                let result = self.sql_to_expr(
+                    expr,
+                    definition_schema.as_deref().unwrap_or(schema),
+                    planner_context,
+                );
+                planner_context.identifier_expansions.pop();
+                planner_context.identifier_clause = clause;
+                return result.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn sql_identifier_to_expr(
         &self,
         id: Ident,
@@ -45,7 +155,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             // interpret names with '.' as if they were
             // compound identifiers, but this is not a compound
             // identifier. (e.g. it is "foo.bar" not foo.bar)
-            let normalize_ident = self.ident_normalizer.normalize(id);
+            let normalize_ident = self.ident_normalizer.normalize(id.clone());
 
             // lambdas parameters have higher precedence
             if let Some(field) = planner_context.lambda_parameters().get(&normalize_ident)
@@ -58,6 +168,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     lambda_var.spans_mut().add_span(span);
                 }
                 return Ok(Expr::LambdaVariable(lambda_var));
+            }
+
+            if let Some(expr) = self.resolve_column_reference(
+                std::slice::from_ref(&id),
+                schema,
+                planner_context,
+            )? {
+                return Ok(expr);
             }
 
             // Check for qualified field with unqualified name
@@ -131,6 +249,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 })?;
             Ok(Expr::ScalarVariable(field, var_names))
         } else {
+            if let Some(expr) =
+                self.resolve_column_reference(&ids, schema, planner_context)?
+            {
+                return Ok(expr);
+            }
             let ids = ids
                 .into_iter()
                 .map(|id| self.ident_normalizer.normalize(id))
