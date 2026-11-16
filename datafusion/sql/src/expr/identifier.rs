@@ -9,13 +9,59 @@ use datafusion_common::{
     exec_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr::expr::LambdaVariable;
-use datafusion_expr::planner::PlannerResult;
+use datafusion_expr::planner::{
+    IdentifierClause, IdentifierPlannerContext, PlannerResult,
+};
 use datafusion_expr::{Case, Expr};
-use sqlparser::ast::{CaseWhen, Expr as SQLExpr, Ident};
+use sqlparser::ast::{CaseWhen, Expr as SQLExpr, Ident, SelectItem};
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_expr::UNNAMED_TABLE;
+
+struct IdentifierContext<'a, 'b, S: ContextProvider> {
+    planner: &'a SqlToRel<'b, S>,
+    planner_context: &'a mut PlannerContext,
+    schema: &'a DFSchema,
+    name: &'a str,
+}
+
+impl<S: ContextProvider> IdentifierPlannerContext for IdentifierContext<'_, '_, S> {
+    fn projection(&self) -> &[SelectItem] {
+        &self.planner_context.identifier_projection
+    }
+
+    fn clause(&self) -> IdentifierClause {
+        self.planner_context.identifier_clause
+    }
+
+    fn outer_query_schemas(&self) -> &[datafusion_common::DFSchemaRef] {
+        self.planner_context.outer_queries_schemas()
+    }
+
+    fn normalize_ident(&self, identifier: Ident) -> String {
+        self.planner.ident_normalizer.normalize(identifier)
+    }
+
+    fn sql_to_expr(&mut self, expr: SQLExpr) -> Result<Expr> {
+        if self
+            .planner_context
+            .identifier_expansions
+            .iter()
+            .any(|name| name == self.name)
+        {
+            return plan_err!("Cyclic identifier expansion: {}", self.name);
+        }
+        self.planner_context
+            .identifier_expansions
+            .push(self.name.to_owned());
+        let result = self
+            .planner
+            .sql_to_expr(expr, self.schema, self.planner_context);
+        self.planner_context.identifier_expansions.pop();
+        result
+    }
+}
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn sql_identifier_to_expr(
@@ -45,7 +91,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             // interpret names with '.' as if they were
             // compound identifiers, but this is not a compound
             // identifier. (e.g. it is "foo.bar" not foo.bar)
-            let normalize_ident = self.ident_normalizer.normalize(id);
+            let normalize_ident = self.ident_normalizer.normalize(id.clone());
 
             // lambdas parameters have higher precedence
             if let Some(field) = planner_context.lambda_parameters().get(&normalize_ident)
@@ -58,6 +104,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     lambda_var.spans_mut().add_span(span);
                 }
                 return Ok(Expr::LambdaVariable(lambda_var));
+            }
+
+            for planner in self.context_provider.get_expr_planners() {
+                let mut context = IdentifierContext {
+                    planner: self,
+                    planner_context,
+                    schema,
+                    name: &normalize_ident,
+                };
+                if let Some(expr) = planner.plan_identifier(&id, schema, &mut context)? {
+                    return Ok(expr);
+                }
             }
 
             // Check for qualified field with unqualified name
