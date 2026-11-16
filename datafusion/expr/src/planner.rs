@@ -401,12 +401,34 @@ pub enum RelationPlanning {
     Original(Box<TableFactor>),
 }
 
+/// Resolution of a CTE name already bound by an enclosing query.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CteConflictResolution {
+    /// Validate the inner definition but keep references bound to the outer CTE.
+    KeepOuter,
+    /// Bind subsequent references in the inner query to its new definition.
+    UseInner,
+}
+
 /// Customize planning SQL table factors to [`LogicalPlan`]s.
 #[cfg(feature = "sql")]
 /// For more background, please also see the [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Choose precedence when a nested query reuses an enclosing CTE's name.
+    ///
+    /// `name` is normalized according to the SQL planner's identifier options.
+    /// `None` defers to the next planner; if all defer, the existing duplicate-name
+    /// error is retained. Duplicates within a single WITH block always fail.
+    /// Both choices validate the inner definition. Query-local bindings never
+    /// change the enclosing query's CTE map.
+    fn resolve_cte_conflict(&self, _name: &str) -> Result<Option<CteConflictResolution>> {
+        Ok(None)
+    }
+
     /// Plan a table factor into a [`LogicalPlan`].
     ///
     /// Returning [`RelationPlanning::Planned`] short-circuits further planning and uses the

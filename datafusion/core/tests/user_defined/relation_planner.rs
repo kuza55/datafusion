@@ -727,3 +727,67 @@ mod tests {
         ");
     }
 }
+
+#[derive(Debug)]
+struct CtePrecedence(datafusion_expr::planner::CteConflictResolution);
+
+impl RelationPlanner for CtePrecedence {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn resolve_cte_conflict(
+        &self,
+        _name: &str,
+    ) -> Result<Option<datafusion_expr::planner::CteConflictResolution>> {
+        Ok(Some(self.0))
+    }
+}
+
+#[tokio::test]
+async fn cte_conflict_policy_execution() -> Result<()> {
+    use datafusion_expr::planner::CteConflictResolution::{KeepOuter, UseInner};
+    let sql = "WITH t AS (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) SELECT x FROM t) AS nested, x AS outer_value FROM t";
+    assert!(SessionContext::new().sql(sql).await.is_err());
+    for (policy, expected) in [(KeepOuter, 1), (UseInner, 2)] {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres"),
+        );
+        ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+        ctx.register_relation_planner(Arc::new(CtePrecedence(policy)))?;
+        for sql in [
+            sql.to_owned(),
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH RECURSIVE t(x) AS (SELECT 2 UNION ALL SELECT x+1 FROM t WHERE x<2) SELECT x AS nested FROM t) u CROSS JOIN t".to_owned(),
+            sql.replace("t AS (SELECT 2", "t AS MATERIALIZED (SELECT 2"),
+            "WITH t AS (SELECT 1 AS x), u AS (WITH t AS (SELECT 2 AS x) SELECT x FROM t) SELECT u.x AS nested, t.x AS outer_value FROM u CROSS JOIN t".to_owned(),
+            "WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH T AS (SELECT 2 AS x) SELECT x AS nested FROM t) u CROSS JOIN t".to_owned(),
+        ] {
+            let batches = ctx.sql(&sql).await?.collect().await?;
+            for (i, value) in [expected, 1].into_iter().enumerate() {
+                assert_eq!(batches[0].column(i).as_any().downcast_ref::<Int64Array>().unwrap().value(0), value, "{sql}");
+            }
+        }
+        for sql in [
+            "WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t",
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT 2), t AS (SELECT 3) SELECT * FROM t) u",
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT missing_column) SELECT * FROM t) u",
+        ] {
+            assert!(ctx.sql(sql).await.is_err(), "{sql}");
+        }
+        let batches = ctx.sql("WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH \"T\" AS (SELECT 2 AS x) SELECT x AS nested FROM \"T\") u CROSS JOIN t").await?.collect().await?;
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+    }
+    Ok(())
+}
