@@ -189,3 +189,67 @@ async fn test_deferred_struct_colon_operator() {
         ScalarValue::Int64(Some(1))
     );
 }
+
+#[derive(Debug)]
+struct NumericLiteralPlanner;
+
+impl ExprPlanner for NumericLiteralPlanner {
+    fn plan_numeric_literal(
+        &self,
+        literal: datafusion_expr::planner::RawNumericLiteral,
+    ) -> Result<PlannerResult<datafusion_expr::planner::RawNumericLiteral>> {
+        let value = match literal.value.as_str() {
+            "1.2300" => ScalarValue::Decimal128(
+                Some(if literal.negative { -12300 } else { 12300 }),
+                10,
+                4,
+            ),
+            "1e2" if !literal.negative => ScalarValue::Int32(Some(100)),
+            "7" if literal.long && !literal.negative => ScalarValue::Int32(Some(7)),
+            "1_000" if !literal.negative => ScalarValue::Int32(Some(1000)),
+            "999" => {
+                return datafusion_common::plan_err!("literal rejected by extension");
+            }
+            _ => return Ok(PlannerResult::Original(literal)),
+        };
+        Ok(PlannerResult::Planned(lit(value)))
+    }
+}
+
+#[tokio::test]
+async fn custom_numeric_literals_preserve_token_and_sign() -> Result<()> {
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "spark");
+    let mut ctx = SessionContext::new_with_config(config);
+    ctx.register_expr_planner(Arc::new(MyCustomPlanner))?;
+    ctx.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
+    let batches = ctx
+        .sql("SELECT 1.2300, -1.2300, 1e2, 7L, -9223372036854775808 AS min_int, 42, -42, 0.5")
+        .await?
+        .collect()
+        .await?;
+    let expected = [
+        ScalarValue::Decimal128(Some(12300), 10, 4),
+        ScalarValue::Decimal128(Some(-12300), 10, 4),
+        ScalarValue::Int32(Some(100)),
+        ScalarValue::Int32(Some(7)),
+        ScalarValue::Int64(Some(i64::MIN)),
+        ScalarValue::Int64(Some(42)),
+        ScalarValue::Int64(Some(-42)),
+        ScalarValue::Float64(Some(0.5)),
+    ];
+    for (column, expected) in batches[0].columns().iter().zip(expected) {
+        assert_eq!(ScalarValue::try_from_array(column, 0)?, expected);
+    }
+    let mut postgres = SessionContext::new_with_config(
+        SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres"),
+    );
+    postgres.register_expr_planner(Arc::new(NumericLiteralPlanner))?;
+    let batches = postgres.sql("SELECT 1_000").await?.collect().await?;
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0)?,
+        ScalarValue::Int32(Some(1000))
+    );
+    let error = ctx.sql("SELECT 999").await.unwrap_err().to_string();
+    assert!(error.contains("literal rejected by extension"), "{error}");
+    Ok(())
+}

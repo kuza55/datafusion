@@ -1817,11 +1817,11 @@ mod tests {
 
         for (literal, out_positive, out_negative) in test_cases {
             assert_eq!(
-                sql_to_rel.parse_sql_number(literal, false).unwrap(),
+                sql_to_rel.parse_sql_number(literal, false, false).unwrap(),
                 Expr::Literal(out_positive, None)
             );
             assert_eq!(
-                sql_to_rel.parse_sql_number(literal, true).unwrap(),
+                sql_to_rel.parse_sql_number(literal, true, false).unwrap(),
                 Expr::Literal(out_negative, None)
             );
         }
