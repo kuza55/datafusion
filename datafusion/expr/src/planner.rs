@@ -407,6 +407,20 @@ pub enum RelationPlanning {
 ///
 /// [Extending SQL in DataFusion: from ->> to TABLESAMPLE blog]: https://datafusion.apache.org/blog/2026/01/12/extending-sql
 pub trait RelationPlanner: Debug + Send + Sync {
+    /// Customize normalized column aliases before they are applied to a relation.
+    ///
+    /// The first `Some` result supplies one name per input field; cardinality and
+    /// schema uniqueness are still validated by DataFusion. `None` preserves the
+    /// default exact-length requirement. Empty alias lists do not invoke this hook.
+    /// This also applies to CTE column lists and recursive CTE seed columns.
+    fn plan_column_aliases(
+        &self,
+        _aliases: &[String],
+        _schema: &DFSchema,
+    ) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+
     /// Plan a table factor into a [`LogicalPlan`].
     ///
     /// Returning [`RelationPlanning::Planned`] short-circuits further planning and uses the

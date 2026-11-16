@@ -727,3 +727,77 @@ mod tests {
         ");
     }
 }
+
+#[derive(Debug)]
+struct PrefixColumnAliases;
+
+impl RelationPlanner for PrefixColumnAliases {
+    fn plan_relation(
+        &self,
+        relation: TableFactor,
+        _context: &mut dyn RelationPlannerContext,
+    ) -> Result<RelationPlanning> {
+        Ok(RelationPlanning::Original(Box::new(relation)))
+    }
+
+    fn plan_column_aliases(
+        &self,
+        aliases: &[String],
+        schema: &datafusion_common::DFSchema,
+    ) -> Result<Option<Vec<String>>> {
+        if aliases.len() > schema.fields().len() {
+            return datafusion_common::plan_err!("Too many column aliases");
+        }
+        Ok(Some(
+            aliases
+                .iter()
+                .cloned()
+                .chain(
+                    schema.fields()[aliases.len()..]
+                        .iter()
+                        .map(|f| f.name().clone()),
+                )
+                .collect(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn column_alias_policy_execution() -> Result<()> {
+    let ctx = SessionContext::new();
+    let partial = "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(x)";
+    assert!(ctx.sql(partial).await.is_err());
+    ctx.register_relation_planner(Arc::new(PassThroughPlanner))?;
+    ctx.register_relation_planner(Arc::new(PrefixColumnAliases))?;
+    for sql in [
+        partial,
+        "WITH RECURSIVE t(x) AS (SELECT 1 AS a, 2 AS b UNION ALL SELECT x + 1, b FROM t WHERE x < 2) SELECT x, b FROM t WHERE x = 1",
+        "WITH t(x) AS (SELECT 1 AS a, 2 AS b) SELECT x, b FROM t",
+        "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(x, b)",
+        "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(X)",
+        "SELECT \"X\", b FROM (SELECT 1 AS a, 2 AS b) t(\"X\")",
+    ] {
+        let batches = ctx.sql(sql).await?.collect().await?;
+        assert_eq!(batches[0].num_columns(), 2, "{sql}");
+        for (i, expected) in [1, 2].into_iter().enumerate() {
+            assert_eq!(
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+    for sql in [
+        "SELECT a FROM (SELECT 1 AS a, 2 AS b) t(x)",
+        "SELECT * FROM (SELECT 1 AS a, 2 AS b) t(x, y, z)",
+        "SELECT * FROM (SELECT 1 AS a, 2 AS b) t(b)",
+    ] {
+        assert!(ctx.sql(sql).await.is_err(), "{sql}");
+    }
+    Ok(())
+}
