@@ -564,28 +564,34 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             .build()
     }
 
+    /// Rename the leading columns of `plan`. As in PostgreSQL, a list shorter
+    /// than the schema leaves the remaining columns unchanged.
     pub(crate) fn apply_expr_alias(
         &self,
         plan: LogicalPlan,
         idents: Vec<Ident>,
     ) -> Result<LogicalPlan> {
         if idents.is_empty() {
-            Ok(plan)
-        } else if idents.len() != plan.schema().fields().len() {
-            plan_err!(
-                "Source table contains {} columns but only {} \
-                names given as column alias",
-                plan.schema().fields().len(),
-                idents.len()
-            )
-        } else {
-            let columns = plan.schema().columns();
-            LogicalPlanBuilder::from(plan)
-                .project(columns.into_iter().zip(idents).map(|(col, ident)| {
-                    Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
-                }))?
-                .build()
+            return Ok(plan);
         }
+        let columns = plan.schema().columns();
+        if idents.len() > columns.len() {
+            return plan_err!(
+                "Source table contains {} columns but {} \
+                names given as column alias",
+                columns.len(),
+                idents.len()
+            );
+        }
+        let mut idents = idents.into_iter();
+        LogicalPlanBuilder::from(plan)
+            .project(columns.into_iter().map(|col| match idents.next() {
+                Some(ident) => {
+                    Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
+                }
+                None => Expr::Column(col),
+            }))?
+            .build()
     }
 
     /// Validate the schema provides all of the columns referenced in the expressions.
