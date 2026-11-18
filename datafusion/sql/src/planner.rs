@@ -23,7 +23,7 @@ use datafusion_common::{
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
-use datafusion_expr::planner::{ColumnAliasArity, ColumnAliasSite, IdentifierClause};
+use datafusion_expr::planner::{ColumnAliasCoverage, ColumnAliasSite, IdentifierClause};
 use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
@@ -591,7 +591,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let columns = plan.schema().columns();
         if idents.len() < columns.len()
             && let Some(policy) = self.context_provider.get_binding_policy()
-            && policy.column_alias_arity(site) == ColumnAliasArity::Exact
+            && policy.column_alias_coverage(site) == ColumnAliasCoverage::All
         {
             return plan_err!(
                 "Source table contains {} columns but only {} \

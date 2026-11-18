@@ -8,7 +8,7 @@ use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::planner::{
-    BindingOrigin, BindingScope, ColumnAliasArity, ColumnAliasSite, ColumnBinding,
+    BindingOrigin, BindingScope, ColumnAliasCoverage, ColumnAliasSite, ColumnBinding,
     ColumnLookup, CtePrecedence, IdentifierClause, SqlBindingPolicy,
 };
 
@@ -220,10 +220,10 @@ impl SqlBindingPolicy for OuterCtes {
         CtePrecedence::Outer
     }
 
-    fn column_alias_arity(&self, site: ColumnAliasSite) -> ColumnAliasArity {
+    fn column_alias_coverage(&self, site: ColumnAliasSite) -> ColumnAliasCoverage {
         match site {
-            ColumnAliasSite::Cte => ColumnAliasArity::Exact,
-            _ => ColumnAliasArity::Partial,
+            ColumnAliasSite::Cte => ColumnAliasCoverage::All,
+            _ => ColumnAliasCoverage::Prefix,
         }
     }
 }
@@ -261,7 +261,7 @@ async fn policy_rejects_nested_cte_names() -> Result<()> {
 }
 
 #[tokio::test]
-async fn policy_sets_cte_precedence_and_alias_arity() -> Result<()> {
+async fn policy_sets_cte_precedence_and_alias_coverage() -> Result<()> {
     let ctx = context(OuterCtes);
     for sql in [
         "WITH t AS (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) SELECT x FROM t) AS nested, x FROM t",

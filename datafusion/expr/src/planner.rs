@@ -332,9 +332,9 @@ pub trait SqlBindingPolicy: Debug + Send + Sync {
         CtePrecedence::Inner
     }
 
-    /// How many names a column alias list must give for the relation it renames.
-    fn column_alias_arity(&self, _site: ColumnAliasSite) -> ColumnAliasArity {
-        ColumnAliasArity::Partial
+    /// Which of a relation's columns a column alias list must name.
+    fn column_alias_coverage(&self, _site: ColumnAliasSite) -> ColumnAliasCoverage {
+        ColumnAliasCoverage::Prefix
     }
 }
 
@@ -351,16 +351,19 @@ pub enum CtePrecedence {
     Error,
 }
 
-/// How many names a column alias list must give.
+/// Which of a relation's columns a column alias list must name.
+///
+/// Aliases are positional: the first alias renames the first column. A list
+/// longer than the relation is always an error.
 #[cfg(feature = "sql")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ColumnAliasArity {
-    /// The list may be shorter than the relation; the remaining columns keep
-    /// their names.
-    Partial,
-    /// The list must name every column.
-    Exact,
+pub enum ColumnAliasCoverage {
+    /// The list names the first `n` columns, for any `n` from one up to the
+    /// number of columns. Columns after the `n`th keep their existing names.
+    Prefix,
+    /// The list names every column.
+    All,
 }
 
 /// Where a column alias list appears.
