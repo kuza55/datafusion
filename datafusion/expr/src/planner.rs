@@ -91,6 +91,12 @@ pub trait ContextProvider {
         None
     }
 
+    /// Return the [`SqlBindingPolicy`] that decides how SQL names bind
+    #[cfg(feature = "sql")]
+    fn get_binding_policy(&self) -> Option<&dyn SqlBindingPolicy> {
+        None
+    }
+
     /// Return the scalar function with a given name, if any
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>>;
 
@@ -291,6 +297,181 @@ pub trait ExprPlanner: Debug + Send + Sync {
     /// Returns original expression arguments if not possible
     fn plan_window(&self, expr: RawWindowExpr) -> Result<PlannerResult<RawWindowExpr>> {
         Ok(PlannerResult::Original(expr))
+    }
+}
+
+/// A SQL dialect's rules for binding names.
+///
+/// DataFusion finds the definitions a name could refer to and the policy picks
+/// one. A policy never builds expressions or plans, so scoping, alias expansion
+/// and correlation stay with the SQL planner.
+///
+/// Name binding is one decision per session rather than a chain of handlers,
+/// so a single policy is registered through
+/// [`ContextProvider::get_binding_policy`], like [`TypePlanner`]. Without a
+/// policy the SQL planner does no extra work.
+#[cfg(feature = "sql")]
+pub trait SqlBindingPolicy: Debug + Send + Sync {
+    /// Choose the definition a column reference binds to.
+    ///
+    /// Return one of [`ColumnLookup::candidates`], or `None` to keep
+    /// DataFusion's own lookup, including its ambiguity checks. An error
+    /// rejects the reference. Covers bare and qualified names; nested field
+    /// access keeps its existing planning.
+    fn resolve_column<'a>(
+        &self,
+        _lookup: &ColumnLookup<'a>,
+    ) -> Result<Option<&'a ColumnBinding>> {
+        Ok(None)
+    }
+}
+
+/// SQL clause containing the identifier being planned.
+///
+/// Window arguments inherit their containing clause. `From` includes join
+/// predicates and table-function arguments; nested queries have their own scope.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdentifierClause {
+    /// A projection item, indexed before wildcard expansion.
+    Select {
+        /// Zero-based position in the unexpanded SELECT list.
+        index: usize,
+    },
+    /// FROM relations, join predicates and table-function arguments.
+    From,
+    /// WHERE predicate.
+    Where,
+    /// GROUP BY expression.
+    GroupBy,
+    /// HAVING predicate.
+    Having,
+    /// QUALIFY predicate.
+    Qualify,
+    /// ORDER BY expression.
+    OrderBy,
+    /// An expression outside the clauses above.
+    Other,
+}
+
+/// The query whose scope defines a [`ColumnBinding`].
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BindingScope {
+    /// The query containing the reference.
+    Current,
+    /// An enclosing query; depth zero is the nearest.
+    Outer {
+        /// Number of queries between the reference's query and this one.
+        depth: usize,
+    },
+}
+
+/// What a [`ColumnBinding`] refers to within its [`BindingScope`].
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BindingOrigin {
+    /// A column of the query's input relations.
+    Input,
+    /// An explicitly named SELECT expression.
+    SelectAlias {
+        /// Zero-based position in the unexpanded SELECT list.
+        index: usize,
+    },
+}
+
+/// A definition that a column reference could bind to.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnBinding {
+    column: datafusion_common::Column,
+    scope: BindingScope,
+    origin: BindingOrigin,
+}
+
+#[cfg(feature = "sql")]
+impl ColumnBinding {
+    /// Normalized name and optional relation qualifier.
+    pub fn column(&self) -> &datafusion_common::Column {
+        &self.column
+    }
+    /// The query that defines this binding.
+    pub fn scope(&self) -> BindingScope {
+        self.scope
+    }
+    /// What this binding refers to in that query.
+    pub fn origin(&self) -> BindingOrigin {
+        self.origin
+    }
+
+    /// Construct binding metadata for SQL planner dispatch.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        column: datafusion_common::Column,
+        scope: BindingScope,
+        origin: BindingOrigin,
+    ) -> Self {
+        Self {
+            column,
+            scope,
+            origin,
+        }
+    }
+}
+
+/// A column reference and the definitions it could bind to.
+///
+/// Binding to a SELECT alias plans the alias's expression in the scope that
+/// defines it; it does not guarantee the expression is evaluated once.
+#[cfg(feature = "sql")]
+#[derive(Debug)]
+pub struct ColumnLookup<'a> {
+    identifiers: &'a [Ident],
+    clause: IdentifierClause,
+    candidates: &'a [ColumnBinding],
+}
+
+#[cfg(feature = "sql")]
+impl<'a> ColumnLookup<'a> {
+    /// Original identifier parts, including quoting and source spans.
+    pub fn identifiers(&self) -> &'a [Ident] {
+        self.identifiers
+    }
+    /// Clause containing this reference.
+    pub fn clause(&self) -> IdentifierClause {
+        self.clause
+    }
+    /// Definitions matching the name. Precedence and ambiguity are the
+    /// policy's to decide.
+    pub fn candidates(&self) -> &'a [ColumnBinding] {
+        self.candidates
+    }
+
+    /// Construct a lookup for SQL planner dispatch.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn new(
+        identifiers: &'a [Ident],
+        clause: IdentifierClause,
+        candidates: &'a [ColumnBinding],
+    ) -> Self {
+        Self {
+            identifiers,
+            clause,
+            candidates,
+        }
     }
 }
 

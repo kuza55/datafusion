@@ -47,7 +47,7 @@ use datafusion_expr::expr_rewriter::FunctionRewrite;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::planner::ExprPlanner;
 #[cfg(feature = "sql")]
-use datafusion_expr::planner::{RelationPlanner, TypePlanner};
+use datafusion_expr::planner::{RelationPlanner, SqlBindingPolicy, TypePlanner};
 use datafusion_expr::registry::{
     ExtensionTypeRegistryRef, FunctionRegistry, MemoryExtensionTypeRegistry,
     SerializerRegistry,
@@ -155,6 +155,9 @@ struct SessionStateInner {
     /// Provides support for customizing the SQL type planning
     #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
+    /// The SQL dialect's name-binding rules
+    #[cfg(feature = "sql")]
+    binding_policy: Option<Arc<dyn SqlBindingPolicy>>,
     /// Responsible for optimizing a logical plan
     optimizer: Optimizer,
     /// Responsible for optimizing a physical execution plan
@@ -1161,6 +1164,8 @@ pub struct SessionStateBuilder {
     relation_planners: Option<Vec<Arc<dyn RelationPlanner>>>,
     #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
+    #[cfg(feature = "sql")]
+    binding_policy: Option<Arc<dyn SqlBindingPolicy>>,
     optimizer: Option<Optimizer>,
     physical_optimizers: Option<PhysicalOptimizer>,
     query_planner: Option<Arc<dyn QueryPlanner + Send + Sync>>,
@@ -1205,6 +1210,8 @@ impl SessionStateBuilder {
             relation_planners: None,
             #[cfg(feature = "sql")]
             type_planner: None,
+            #[cfg(feature = "sql")]
+            binding_policy: None,
             optimizer: None,
             physical_optimizers: None,
             query_planner: None,
@@ -1267,6 +1274,8 @@ impl SessionStateBuilder {
             relation_planners: Some(existing.relation_planners),
             #[cfg(feature = "sql")]
             type_planner: existing.type_planner,
+            #[cfg(feature = "sql")]
+            binding_policy: existing.binding_policy,
             optimizer: Some(existing.optimizer),
             physical_optimizers: Some(existing.physical_optimizers),
             query_planner: Some(existing.query_planner),
@@ -1435,6 +1444,16 @@ impl SessionStateBuilder {
     #[cfg(feature = "sql")]
     pub fn with_type_planner(mut self, type_planner: Arc<dyn TypePlanner>) -> Self {
         self.type_planner = Some(type_planner);
+        self
+    }
+
+    /// Set the [`SqlBindingPolicy`] that decides how SQL names bind.
+    #[cfg(feature = "sql")]
+    pub fn with_binding_policy(
+        mut self,
+        binding_policy: Arc<dyn SqlBindingPolicy>,
+    ) -> Self {
+        self.binding_policy = Some(binding_policy);
         self
     }
 
@@ -1706,6 +1725,8 @@ impl SessionStateBuilder {
             relation_planners,
             #[cfg(feature = "sql")]
             type_planner,
+            #[cfg(feature = "sql")]
+            binding_policy,
             optimizer,
             physical_optimizers,
             query_planner,
@@ -1743,6 +1764,8 @@ impl SessionStateBuilder {
             relation_planners: relation_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             type_planner,
+            #[cfg(feature = "sql")]
+            binding_policy,
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
             query_planner: query_planner
@@ -2135,6 +2158,10 @@ impl ContextProvider for SessionContextProvider<'_> {
         } else {
             None
         }
+    }
+
+    fn get_binding_policy(&self) -> Option<&dyn SqlBindingPolicy> {
+        self.state.inner.binding_policy.as_deref()
     }
 
     fn get_table_source(
