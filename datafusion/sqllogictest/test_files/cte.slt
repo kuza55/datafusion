@@ -219,7 +219,7 @@ SELECT n FROM t
 
 # recursive CTE column-list alias arity mismatch is rejected cleanly (raised at
 # the static term, rather than the old confusing "No field named ...")
-query error DataFusion error: Error during planning: Source table contains 1 columns but only 2 names given as column alias
+query error DataFusion error: Error during planning: Source table contains 1 columns but 2 names given as column alias
 WITH RECURSIVE t(a, b) AS (
     SELECT 1
     UNION ALL
@@ -1246,8 +1246,38 @@ SELECT * FROM
 400 500 2
 400 500 3
 
-query error DataFusion error: Error during planning: Source table contains 3 columns but only 1 names given as column alias
-with numbers(a) as (select 1, 2, 3) select * from numbers;
+# A column alias list shorter than the schema renames the leading columns
+query III
+with numbers(a) as (select 1, 2 as b, 3 as c) select a, b, c from numbers;
+----
+1 2 3
+
+query II
+select x, b from (select 1 as a, 2 as b) t(x);
+----
+1 2
+
+# The replaced name is no longer visible
+query error DataFusion error: Schema error: No field named a\.
+select a from (select 1 as a, 2 as b) t(x);
+
+# An alias may not collide with a column that keeps its name
+query error DataFusion error: Error during planning: Projections require unique expression names
+select * from (select 1 as a, 2 as b) t(b);
+
+query II rowsort
+with recursive t(n) as (
+    select 1 as a, 10 as k
+    union all
+    select n + 1, k from t where n < 2
+)
+select n, k from t;
+----
+1 10
+2 10
+
+query error DataFusion error: Error during planning: Source table contains 2 columns but 3 names given as column alias
+select * from (select 1 as a, 2 as b) t(x, y, z);
 
 query TT
 explain with numbers(a,b,c) as (select 1 as x, 2 as y, 3 as z) select * from numbers;
