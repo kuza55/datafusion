@@ -104,7 +104,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         )?
         .data;
         if let Some(alias) = planned_relation.alias {
-            self.apply_table_alias(optimized_plan, alias)
+            self.apply_table_alias(
+                optimized_plan,
+                alias,
+                datafusion_expr::planner::ColumnAliasSite::Table,
+            )
         } else {
             Ok(optimized_plan)
         }

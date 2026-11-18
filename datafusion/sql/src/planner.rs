@@ -23,7 +23,7 @@ use datafusion_common::{
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
-use datafusion_expr::planner::IdentifierClause;
+use datafusion_expr::planner::{ColumnAliasSite, IdentifierClause};
 use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
@@ -564,9 +564,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         &self,
         plan: LogicalPlan,
         alias: TableAlias,
+        site: ColumnAliasSite,
     ) -> Result<LogicalPlan> {
         let idents = alias.columns.into_iter().map(|c| c.name).collect();
-        let plan = self.apply_expr_alias(plan, idents)?;
+        let plan = self.apply_expr_alias(plan, idents, site)?;
 
         LogicalPlanBuilder::from(plan)
             .alias(TableReference::bare(
@@ -576,16 +577,29 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Rename the leading columns of `plan`. As in PostgreSQL, a list shorter
-    /// than the schema leaves the remaining columns unchanged.
+    /// than the schema leaves the remaining columns unchanged, unless the
+    /// binding policy requires a complete list.
     pub(crate) fn apply_expr_alias(
         &self,
         plan: LogicalPlan,
         idents: Vec<Ident>,
+        site: ColumnAliasSite,
     ) -> Result<LogicalPlan> {
         if idents.is_empty() {
             return Ok(plan);
         }
         let columns = plan.schema().columns();
+        if idents.len() < columns.len()
+            && let Some(policy) = self.context_provider.get_binding_policy()
+            && !policy.allows_partial_column_aliases(site)
+        {
+            return plan_err!(
+                "Source table contains {} columns but only {} \
+                names given as column alias",
+                columns.len(),
+                idents.len()
+            );
+        }
         if idents.len() > columns.len() {
             return plan_err!(
                 "Source table contains {} columns but {} \

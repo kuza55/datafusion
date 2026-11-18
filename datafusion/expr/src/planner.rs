@@ -324,6 +324,43 @@ pub trait SqlBindingPolicy: Debug + Send + Sync {
     ) -> Result<Option<&'a ColumnBinding>> {
         Ok(None)
     }
+
+    /// Which definition a name refers to when a nested `WITH` reuses the name
+    /// of a CTE from an enclosing query. Both definitions are planned and
+    /// validated either way.
+    fn nested_cte_precedence(&self) -> CtePrecedence {
+        CtePrecedence::Inner
+    }
+
+    /// Whether a column alias list may be shorter than the relation it
+    /// renames, leaving the remaining columns' names unchanged.
+    fn allows_partial_column_aliases(&self, _site: ColumnAliasSite) -> bool {
+        true
+    }
+}
+
+/// Precedence between CTEs of the same name in nested queries.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CtePrecedence {
+    /// The nested definition shadows the enclosing one, as in standard SQL.
+    Inner,
+    /// References keep binding to the enclosing definition.
+    Outer,
+}
+
+/// Where a column alias list appears.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnAliasSite {
+    /// A table alias in FROM, such as `t(a, b)`.
+    Table,
+    /// A CTE definition, such as `WITH t(a, b) AS (...)`.
+    Cte,
+    /// A view definition, such as `CREATE VIEW v(a, b) AS ...`.
+    View,
 }
 
 /// SQL clause containing the identifier being planned.

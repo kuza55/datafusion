@@ -8,8 +8,8 @@ use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::planner::{
-    BindingOrigin, BindingScope, ColumnBinding, ColumnLookup, IdentifierClause,
-    SqlBindingPolicy,
+    BindingOrigin, BindingScope, ColumnAliasSite, ColumnBinding, ColumnLookup,
+    CtePrecedence, IdentifierClause, SqlBindingPolicy,
 };
 
 fn context(policy: impl SqlBindingPolicy + 'static) -> SessionContext {
@@ -208,5 +208,50 @@ async fn policy_chooses_among_columns_and_scopes() -> Result<()> {
         error.to_string().contains("Cyclic identifier expansion"),
         "{error}"
     );
+    Ok(())
+}
+
+/// Outer CTEs win, and CTE column lists must be complete.
+#[derive(Debug)]
+struct OuterCtes;
+
+impl SqlBindingPolicy for OuterCtes {
+    fn nested_cte_precedence(&self) -> CtePrecedence {
+        CtePrecedence::Outer
+    }
+
+    fn allows_partial_column_aliases(&self, site: ColumnAliasSite) -> bool {
+        site != ColumnAliasSite::Cte
+    }
+}
+
+#[tokio::test]
+async fn policy_sets_cte_precedence_and_alias_arity() -> Result<()> {
+    let ctx = context(OuterCtes);
+    for sql in [
+        "WITH t AS (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) SELECT x FROM t) AS nested, x FROM t",
+        "WITH t AS (SELECT 1 AS x), u AS (WITH t AS (SELECT 2 AS x) SELECT x FROM t) SELECT u.x, t.x FROM u CROSS JOIN t",
+        "WITH t AS (SELECT 1 AS x) SELECT * FROM (WITH RECURSIVE t(x) AS (SELECT 2 UNION ALL SELECT x + 1 FROM t WHERE x < 3) SELECT max(x) FROM t) u CROSS JOIN t",
+    ] {
+        assert_eq!(rows(&ctx, sql).await?, [[1, 1]], "{sql}");
+    }
+    assert_eq!(
+        rows(&ctx, "SELECT x, b FROM (SELECT 1 AS a, 2 AS b) t(x)").await?,
+        [[1, 2]]
+    );
+    for (sql, message) in [
+        // The ignored definition is still validated
+        (
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT missing) SELECT * FROM t) u",
+            "No field named missing",
+        ),
+        (
+            "WITH t(x) AS (SELECT 1 AS a, 2 AS b) SELECT * FROM t",
+            "contains 2 columns but only 1 names",
+        ),
+    ] {
+        let error = ctx.sql(sql).await.unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
     Ok(())
 }
