@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
@@ -46,11 +47,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<Vec<PendingMaterializedCte>> {
         let is_recursive = with.recursive;
         let mut materialized = vec![];
+        let mut names = HashSet::new();
         // Process CTEs from top to bottom
         for cte in with.cte_tables {
-            // A `WITH` block can't use the same name more than once
+            // A `WITH` block can't use the same name more than once. A name
+            // inherited from an enclosing query is shadowed instead.
             let cte_name = self.ident_normalizer.normalize(cte.alias.name.clone());
-            if planner_context.contains_cte(&cte_name) {
+            if !names.insert(cte_name.clone()) {
                 return plan_err!(
                     "WITH query name {cte_name:?} specified more than once"
                 );
