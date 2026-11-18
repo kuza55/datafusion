@@ -12,6 +12,7 @@ use datafusion_common::{
     Result, TableReference, not_impl_err, plan_err,
     tree_node::{TreeNode, TreeNodeRecursion},
 };
+use datafusion_expr::planner::{ColumnAliasSite, CtePrecedence};
 use datafusion_expr::{
     LogicalPlan, LogicalPlanBuilder, MaterializedCte, MaterializedCteId,
     MaterializedCtePlan, MaterializedCteScan, TableSource,
@@ -59,12 +60,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 );
             }
 
+            let precedence = match self.context_provider.get_binding_policy() {
+                Some(policy) if planner_context.contains_cte(&cte_name) => {
+                    policy.nested_cte_precedence()
+                }
+                _ => CtePrecedence::Inner,
+            };
+            if precedence == CtePrecedence::Error {
+                return plan_err!(
+                    "WITH query name {cte_name:?} specified more than once"
+                );
+            }
+            let keep_outer = precedence == CtePrecedence::Outer;
+            // The definition is still planned, to validate it, but in a scratch
+            // context: a recursive body would otherwise replace the enclosing
+            // binding with its work table.
+            let mut scratch = keep_outer.then(|| planner_context.clone());
+            let body_context = scratch.as_mut().unwrap_or(planner_context);
+
             // Create a logical plan for the CTE
             let cte_plan = if is_recursive {
                 let columns = cte.alias.columns.iter().map(|c| c.name.clone()).collect();
-                self.recursive_cte(&cte_name, columns, *cte.query, planner_context)?
+                self.recursive_cte(&cte_name, columns, *cte.query, body_context)?
             } else {
-                self.non_recursive_cte(*cte.query, planner_context)?
+                self.non_recursive_cte(*cte.query, body_context)?
             };
 
             // Each `WITH` block can change the column names in the last projection
@@ -83,8 +102,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     ))?
                     .build()?
             } else {
-                self.apply_table_alias(cte_plan, cte.alias)?
+                self.apply_table_alias(cte_plan, cte.alias, ColumnAliasSite::Cte)?
             };
+            if keep_outer {
+                continue;
+            }
             if is_materialized {
                 // Every reference reads the shared result instead of a copy
                 // of the body. The body is already planned, so a reference
@@ -147,7 +169,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 // the relation name for recursive CTEs, so apply the column aliases here.
                 *cte_query.body = other;
                 let plan = self.non_recursive_cte(cte_query, planner_context)?;
-                return self.apply_expr_alias(plan, columns);
+                return self.apply_expr_alias(plan, columns, ColumnAliasSite::Cte);
             }
         };
 
@@ -167,7 +189,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Apply the declared column-list aliases (e.g. `t(n)`) to the static term, so
         // the work table built from its schema below exposes the declared names.
-        let static_plan = self.apply_expr_alias(static_plan, columns)?;
+        let static_plan =
+            self.apply_expr_alias(static_plan, columns, ColumnAliasSite::Cte)?;
 
         // Since the recursive CTEs include a component that references a
         // table with its name, like the example below:

@@ -171,6 +171,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     explicit: true,
                     at: None,
                 },
+                datafusion_expr::planner::ColumnAliasSite::Table,
             ),
             PipeOperator::Union {
                 set_quantifier,

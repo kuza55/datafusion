@@ -726,7 +726,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Result<Vec<_>>>()?;
 
                 let mut plan = self.query_to_plan(*query, &mut PlannerContext::new())?;
-                plan = self.apply_expr_alias(plan, columns)?;
+                plan = self.apply_expr_alias(
+                    plan,
+                    columns,
+                    datafusion_expr::planner::ColumnAliasSite::View,
+                )?;
 
                 Ok(LogicalPlan::Ddl(DdlStatement::CreateView(CreateView {
                     name: self.object_name_to_table_reference(name)?,
