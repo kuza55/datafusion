@@ -60,11 +60,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 );
             }
 
-            let keep_outer = planner_context.contains_cte(&cte_name)
-                && self
-                    .context_provider
-                    .get_binding_policy()
-                    .is_some_and(|p| p.nested_cte_precedence() == CtePrecedence::Outer);
+            let precedence = match self.context_provider.get_binding_policy() {
+                Some(policy) if planner_context.contains_cte(&cte_name) => {
+                    policy.nested_cte_precedence()
+                }
+                _ => CtePrecedence::Inner,
+            };
+            if precedence == CtePrecedence::Error {
+                return plan_err!(
+                    "WITH query name {cte_name:?} specified more than once"
+                );
+            }
+            let keep_outer = precedence == CtePrecedence::Outer;
             // The definition is still planned, to validate it, but in a scratch
             // context: a recursive body would otherwise replace the enclosing
             // binding with its work table.

@@ -8,8 +8,8 @@ use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::planner::{
-    BindingOrigin, BindingScope, ColumnAliasSite, ColumnBinding, ColumnLookup,
-    CtePrecedence, IdentifierClause, SqlBindingPolicy,
+    BindingOrigin, BindingScope, ColumnAliasArity, ColumnAliasSite, ColumnBinding,
+    ColumnLookup, CtePrecedence, IdentifierClause, SqlBindingPolicy,
 };
 
 fn context(policy: impl SqlBindingPolicy + 'static) -> SessionContext {
@@ -220,9 +220,44 @@ impl SqlBindingPolicy for OuterCtes {
         CtePrecedence::Outer
     }
 
-    fn allows_partial_column_aliases(&self, site: ColumnAliasSite) -> bool {
-        site != ColumnAliasSite::Cte
+    fn column_alias_arity(&self, site: ColumnAliasSite) -> ColumnAliasArity {
+        match site {
+            ColumnAliasSite::Cte => ColumnAliasArity::Exact,
+            _ => ColumnAliasArity::Partial,
+        }
     }
+}
+
+#[derive(Debug)]
+struct UniqueCtes;
+
+impl SqlBindingPolicy for UniqueCtes {
+    fn nested_cte_precedence(&self) -> CtePrecedence {
+        CtePrecedence::Error
+    }
+}
+
+#[tokio::test]
+async fn policy_rejects_nested_cte_names() -> Result<()> {
+    let ctx = context(UniqueCtes);
+    let error = ctx
+        .sql(
+            "WITH t AS (SELECT 1) SELECT * FROM (WITH t AS (SELECT 2) SELECT * FROM t) u",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("specified more than once"), "{error}");
+    // Sibling queries may still reuse a name
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT * FROM (WITH t AS (SELECT 1 AS x) SELECT x FROM t) a CROSS JOIN (WITH t AS (SELECT 2 AS y) SELECT y FROM t) b"
+        )
+        .await?,
+        [[1, 2]]
+    );
+    Ok(())
 }
 
 #[tokio::test]

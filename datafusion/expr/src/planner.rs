@@ -326,16 +326,15 @@ pub trait SqlBindingPolicy: Debug + Send + Sync {
     }
 
     /// Which definition a name refers to when a nested `WITH` reuses the name
-    /// of a CTE from an enclosing query. Both definitions are planned and
-    /// validated either way.
+    /// of a CTE from an enclosing query. Unless the reuse is rejected, both
+    /// definitions are planned and validated.
     fn nested_cte_precedence(&self) -> CtePrecedence {
         CtePrecedence::Inner
     }
 
-    /// Whether a column alias list may be shorter than the relation it
-    /// renames, leaving the remaining columns' names unchanged.
-    fn allows_partial_column_aliases(&self, _site: ColumnAliasSite) -> bool {
-        true
+    /// How many names a column alias list must give for the relation it renames.
+    fn column_alias_arity(&self, _site: ColumnAliasSite) -> ColumnAliasArity {
+        ColumnAliasArity::Partial
     }
 }
 
@@ -348,6 +347,20 @@ pub enum CtePrecedence {
     Inner,
     /// References keep binding to the enclosing definition.
     Outer,
+    /// Reusing the name is rejected.
+    Error,
+}
+
+/// How many names a column alias list must give.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnAliasArity {
+    /// The list may be shorter than the relation; the remaining columns keep
+    /// their names.
+    Partial,
+    /// The list must name every column.
+    Exact,
 }
 
 /// Where a column alias list appears.
