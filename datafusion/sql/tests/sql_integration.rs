@@ -1145,14 +1145,29 @@ fn table_with_column_alias() {
 }
 
 #[test]
-fn table_with_column_alias_number_cols() {
-    let sql = "SELECT a, b, c
+fn table_with_partial_column_alias() {
+    let sql = "SELECT a, b, l_description
                    FROM lineitem l (a, b)";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: l.a, l.b, l.l_description
+      SubqueryAlias: l
+        Projection: lineitem.l_orderkey AS a, lineitem.l_item_id AS b, lineitem.l_description, lineitem.l_extendedprice, lineitem.price
+          TableScan: lineitem
+    "
+    );
+}
+
+#[test]
+fn table_with_column_alias_number_cols() {
+    let sql = "SELECT a FROM lineitem l (a, b, c, d, e, f)";
     let err = logical_plan(sql).expect_err("query should have failed");
 
     assert_snapshot!(
         err.strip_backtrace(),
-        @"Error during planning: Source table contains 5 columns but only 2 names given as column alias"
+        @"Error during planning: Source table contains 5 columns but 6 names given as column alias"
     );
 }
 
